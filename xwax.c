@@ -46,7 +46,7 @@
 #define DEFAULT_OSS_BUFFERS 8
 #define DEFAULT_OSS_FRAGMENT 7
 
-#define DEFAULT_ALSA_BUFFER 8 /* milliseconds */
+#define DEFAULT_ALSA_BUFFER 16 /* milliseconds */
 
 #define DEFAULT_RATE 44100
 #define DEFAULT_PRIORITY 80

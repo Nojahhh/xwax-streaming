@@ -6,16 +6,20 @@
 #include <SDL.h>
 #include <SDL_ttf.h>
 
-SDL_Surface *surface;
+SDL_Window *window;
+SDL_Renderer *ren;
 TTF_Font *font;
 
 void draw(void)
 {
     const SDL_Color fg = { 255, 255, 255, 255 }, bg = { 0, 0, 0, 255 };
     SDL_Surface *rendered;
+    SDL_Texture *tex;
     SDL_Rect dest, source;
 
     rendered = TTF_RenderText_Shaded(font, "Track at 101.0 BPM a0a0", fg, bg);
+
+    tex = SDL_CreateTextureFromSurface(ren, rendered);
 
     source.x = 0;
     source.y = 0;
@@ -24,11 +28,16 @@ void draw(void)
 
     dest.x = 0;
     dest.y = 0;
+    dest.w = rendered->w;
+    dest.h = rendered->h;
 
-    SDL_BlitSurface(rendered, &source, surface, &dest);
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+    SDL_RenderClear(ren);
+    SDL_RenderCopy(ren, tex, &source, &dest);
+    SDL_RenderPresent(ren);
+
+    SDL_DestroyTexture(tex);
     SDL_FreeSurface(rendered);
-
-    SDL_UpdateRect(surface, 0, 0, source.w, source.h);
 }
 
 int main(int argc, char *argv[])
@@ -53,8 +62,14 @@ int main(int argc, char *argv[])
 #endif
     TTF_SetFontKerning(font, 1);
 
-    surface = SDL_SetVideoMode(400, 200, 32, 0);
-    if (surface == NULL)
+    window = SDL_CreateWindow("TTF Test",
+        SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
+        400, 200, 0);
+    if (window == NULL)
+        abort();
+
+    ren = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+    if (ren == NULL)
         abort();
 
     for (;;) {
@@ -72,6 +87,8 @@ int main(int argc, char *argv[])
     }
 done:
 
+    SDL_DestroyRenderer(ren);
+    SDL_DestroyWindow(window);
     TTF_CloseFont(font);
     TTF_Quit();
     SDL_Quit();

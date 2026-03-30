@@ -302,7 +302,6 @@ static struct track* track_get_reusable()
 
     list_for_each(t, &tracks, tracks) {
         if (t->reusable) {
-            printf("YES!!!\n");
             return t;
         }
     }
