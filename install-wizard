@@ -1,0 +1,833 @@
+#!/bin/sh
+#
+# Copyright (C) 2026 xwax contributors
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 2, as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+# General Public License version 2 for more details.
+#
+# You should have received a copy of the GNU General Public License
+# version 2 along with this program; if not, write to the Free
+# Software Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+# MA 02110-1301, USA.
+#
+# install-wizard: interactive Linux install helper for xwax.
+#
+# Probes the host (distro, CPU, audio backends, libs, hardware), drives
+# the existing configure/make/install pipeline with user confirmation,
+# and optionally sets up the streaming integration (system tool
+# detection, Python venv for scan-spotify, Spotify client id capture).
+#
+# This script is interactive. For non-interactive scripted setups, use
+# ./configure directly.
+#
+
+set -u
+
+# ---- Output helpers ---------------------------------------------------------
+
+if [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ]; then
+	C_BOLD=$(printf '\033[1m')
+	C_DIM=$(printf '\033[2m')
+	C_RED=$(printf '\033[31m')
+	C_GREEN=$(printf '\033[32m')
+	C_YELLOW=$(printf '\033[33m')
+	C_BLUE=$(printf '\033[34m')
+	C_RESET=$(printf '\033[0m')
+else
+	C_BOLD=''
+	C_DIM=''
+	C_RED=''
+	C_GREEN=''
+	C_YELLOW=''
+	C_BLUE=''
+	C_RESET=''
+fi
+
+heading() {
+	printf '\n%s== %s ==%s\n' "$C_BOLD" "$1" "$C_RESET"
+}
+
+info() {
+	printf '  %s\n' "$1"
+}
+
+ok() {
+	printf '  %s[ ok ]%s %s\n' "$C_GREEN" "$C_RESET" "$1"
+}
+
+warn() {
+	printf '  %s[warn]%s %s\n' "$C_YELLOW" "$C_RESET" "$1"
+}
+
+err() {
+	printf '  %s[fail]%s %s\n' "$C_RED" "$C_RESET" "$1" >&2
+}
+
+die() {
+	err "$1"
+	exit 1
+}
+
+# ---- Prompts ----------------------------------------------------------------
+# ask_yn QUESTION DEFAULT (Y or N) -> sets REPLY to y/n
+
+ask_yn() {
+	_q=$1
+	_def=$2
+	if [ "$_def" = "Y" ]; then
+		_hint="[Y/n]"
+	else
+		_hint="[y/N]"
+	fi
+	while :; do
+		printf '  %s %s ' "$_q" "$_hint"
+		if ! IFS= read -r _ans; then
+			REPLY=$(printf '%s' "$_def" | tr '[:upper:]' '[:lower:]')
+			printf '\n'
+			return 0
+		fi
+		if [ -z "$_ans" ]; then
+			REPLY=$(printf '%s' "$_def" | tr '[:upper:]' '[:lower:]')
+			return 0
+		fi
+		case $_ans in
+			y|Y|yes|YES) REPLY=y ; return 0 ;;
+			n|N|no|NO)   REPLY=n ; return 0 ;;
+			*) printf '  Please answer y or n.\n' ;;
+		esac
+	done
+}
+
+# ask_str QUESTION DEFAULT -> sets REPLY to the entered string (or default)
+
+ask_str() {
+	_q=$1
+	_def=$2
+	if [ -n "$_def" ]; then
+		printf '  %s [%s] ' "$_q" "$_def"
+	else
+		printf '  %s ' "$_q"
+	fi
+	if ! IFS= read -r _ans; then
+		REPLY=$_def
+		printf '\n'
+		return 0
+	fi
+	if [ -z "$_ans" ]; then
+		REPLY=$_def
+	else
+		REPLY=$_ans
+	fi
+}
+
+# ask_choice QUESTION DEFAULT OPT1 OPT2 ... -> sets REPLY to chosen option
+
+ask_choice() {
+	_q=$1
+	_def=$2
+	shift 2
+	_opts=$*
+	while :; do
+		printf '  %s (%s) [%s] ' "$_q" "$(echo "$_opts" | tr ' ' '/')" "$_def"
+		if ! IFS= read -r _ans; then
+			REPLY=$_def
+			printf '\n'
+			return 0
+		fi
+		if [ -z "$_ans" ]; then
+			REPLY=$_def
+			return 0
+		fi
+		for _o in $_opts; do
+			if [ "$_ans" = "$_o" ]; then
+				REPLY=$_ans
+				return 0
+			fi
+		done
+		printf '  Please answer one of: %s.\n' "$_opts"
+	done
+}
+
+# ---- Argument parsing -------------------------------------------------------
+
+usage() {
+	cat <<EOF
+Usage: install-wizard [--help]
+
+Interactive installer for xwax. Probes audio backends, libraries, and
+hardware on the local Linux host, then drives configure/make/install
+with confirmation at each step. Also offers to set up the streaming
+integration (ffmpeg/yt-dlp/jq/librespot detection, Python venv for
+scan-spotify, Spotify client id capture).
+
+For non-interactive / scripted setups use ./configure directly.
+
+Options:
+  --help    Show this help and exit.
+EOF
+}
+
+while [ $# -ge 1 ]; do
+	case $1 in
+		--help|-h) usage; exit 0 ;;
+		*) err "unknown option: $1"; usage; exit 1 ;;
+	esac
+	shift
+done
+
+# ---- Section 1: Sanity checks -----------------------------------------------
+
+heading "Sanity checks"
+
+if [ "$(uname -s)" != "Linux" ]; then
+	die "this wizard is for Linux only (detected $(uname -s)). Use ./configure manually on other systems."
+fi
+ok "Linux host"
+
+WIZARD_DIR=$(cd "$(dirname "$0")" && pwd)
+cd "$WIZARD_DIR" || die "cannot cd to script directory"
+
+if [ ! -f Makefile ] || [ ! -f configure ]; then
+	die "must be run from the xwax source tree (Makefile and configure not found here)"
+fi
+ok "running from xwax source tree at $WIZARD_DIR"
+
+MISSING_TOOLS=
+for _t in make pkg-config; do
+	if ! command -v "$_t" >/dev/null 2>&1; then
+		MISSING_TOOLS="$MISSING_TOOLS $_t"
+	fi
+done
+if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1; then
+	MISSING_TOOLS="$MISSING_TOOLS cc/gcc"
+fi
+if [ -n "$MISSING_TOOLS" ]; then
+	err "missing required build tools:$MISSING_TOOLS"
+	info "Debian/Ubuntu : sudo apt install build-essential pkg-config"
+	info "Fedora/RHEL   : sudo dnf install gcc make pkgconf-pkg-config"
+	info "Arch          : sudo pacman -S base-devel pkgconf"
+	exit 1
+fi
+ok "build tools present (make, cc/gcc, pkg-config)"
+
+# ---- Section 2: System probe ------------------------------------------------
+
+heading "System probe"
+
+DISTRO_ID=unknown
+DISTRO_NAME="unknown Linux"
+if [ -r /etc/os-release ]; then
+	# shellcheck disable=SC1091
+	. /etc/os-release
+	DISTRO_ID=${ID:-unknown}
+	DISTRO_NAME=${PRETTY_NAME:-$DISTRO_ID}
+fi
+info "distro:        $DISTRO_NAME"
+
+ARCH=$(uname -m)
+info "architecture:  $ARCH"
+
+PI4_DETECTED=false
+if [ -r /proc/cpuinfo ]; then
+	if grep -q "Raspberry Pi 4" /proc/cpuinfo 2>/dev/null \
+		|| grep -q "BCM2711" /proc/cpuinfo 2>/dev/null; then
+		PI4_DETECTED=true
+	fi
+fi
+if $PI4_DETECTED; then
+	info "platform:      Raspberry Pi 4 (BCM2711) detected"
+fi
+
+# pkg_install_hint TOKEN: print distro-appropriate install line for TOKEN.
+# TOKEN is one of: sdl2 sdl2_ttf alsa jack oss ffmpeg yt-dlp jq librespot venv
+
+pkg_install_hint() {
+	case $1 in
+		sdl2)
+			case $DISTRO_ID in
+				debian|ubuntu|raspbian|linuxmint|pop) printf 'sudo apt install libsdl2-dev' ;;
+				fedora|rhel|centos|rocky|almalinux)   printf 'sudo dnf install SDL2-devel' ;;
+				arch|manjaro|endeavouros)             printf 'sudo pacman -S sdl2' ;;
+				opensuse*|sles)                       printf 'sudo zypper install libSDL2-devel' ;;
+				*)                                    printf 'install SDL2 development headers' ;;
+			esac ;;
+		sdl2_ttf)
+			case $DISTRO_ID in
+				debian|ubuntu|raspbian|linuxmint|pop) printf 'sudo apt install libsdl2-ttf-dev' ;;
+				fedora|rhel|centos|rocky|almalinux)   printf 'sudo dnf install SDL2_ttf-devel' ;;
+				arch|manjaro|endeavouros)             printf 'sudo pacman -S sdl2_ttf' ;;
+				opensuse*|sles)                       printf 'sudo zypper install libSDL2_ttf-devel' ;;
+				*)                                    printf 'install SDL2_ttf development headers' ;;
+			esac ;;
+		alsa)
+			case $DISTRO_ID in
+				debian|ubuntu|raspbian|linuxmint|pop) printf 'sudo apt install libasound2-dev alsa-utils' ;;
+				fedora|rhel|centos|rocky|almalinux)   printf 'sudo dnf install alsa-lib-devel alsa-utils' ;;
+				arch|manjaro|endeavouros)             printf 'sudo pacman -S alsa-lib alsa-utils' ;;
+				opensuse*|sles)                       printf 'sudo zypper install alsa-devel alsa-utils' ;;
+				*)                                    printf 'install ALSA development headers' ;;
+			esac ;;
+		jack)
+			case $DISTRO_ID in
+				debian|ubuntu|raspbian|linuxmint|pop) printf 'sudo apt install libjack-jackd2-dev (or libjack-dev)' ;;
+				fedora|rhel|centos|rocky|almalinux)   printf 'sudo dnf install jack-audio-connection-kit-devel' ;;
+				arch|manjaro|endeavouros)             printf 'sudo pacman -S jack2' ;;
+				opensuse*|sles)                       printf 'sudo zypper install libjack-devel' ;;
+				*)                                    printf 'install JACK development headers' ;;
+			esac ;;
+		oss)
+			printf 'install OSS soundcard.h headers (rare on modern Linux)' ;;
+		ffmpeg)
+			case $DISTRO_ID in
+				debian|ubuntu|raspbian|linuxmint|pop) printf 'sudo apt install ffmpeg' ;;
+				fedora|rhel|centos|rocky|almalinux)   printf 'sudo dnf install ffmpeg' ;;
+				arch|manjaro|endeavouros)             printf 'sudo pacman -S ffmpeg' ;;
+				opensuse*|sles)                       printf 'sudo zypper install ffmpeg' ;;
+				*)                                    printf 'install ffmpeg' ;;
+			esac ;;
+		yt-dlp)
+			case $DISTRO_ID in
+				debian|ubuntu|raspbian|linuxmint|pop) printf 'sudo apt install yt-dlp  (or: pipx install yt-dlp)' ;;
+				fedora|rhel|centos|rocky|almalinux)   printf 'sudo dnf install yt-dlp' ;;
+				arch|manjaro|endeavouros)             printf 'sudo pacman -S yt-dlp' ;;
+				opensuse*|sles)                       printf 'sudo zypper install yt-dlp' ;;
+				*)                                    printf 'install yt-dlp (https://github.com/yt-dlp/yt-dlp)' ;;
+			esac ;;
+		jq)
+			case $DISTRO_ID in
+				debian|ubuntu|raspbian|linuxmint|pop) printf 'sudo apt install jq' ;;
+				fedora|rhel|centos|rocky|almalinux)   printf 'sudo dnf install jq' ;;
+				arch|manjaro|endeavouros)             printf 'sudo pacman -S jq' ;;
+				opensuse*|sles)                       printf 'sudo zypper install jq' ;;
+				*)                                    printf 'install jq' ;;
+			esac ;;
+		librespot)
+			printf 'cargo install librespot   (recommended; distro packages are often outdated)' ;;
+		venv)
+			case $DISTRO_ID in
+				debian|ubuntu|raspbian|linuxmint|pop) printf 'sudo apt install python3-venv python3-pip' ;;
+				fedora|rhel|centos|rocky|almalinux)   printf 'sudo dnf install python3 python3-pip' ;;
+				arch|manjaro|endeavouros)             printf 'sudo pacman -S python python-pip' ;;
+				opensuse*|sles)                       printf 'sudo zypper install python3 python3-pip' ;;
+				*)                                    printf 'install python3 + venv + pip' ;;
+			esac ;;
+	esac
+}
+
+# Required: SDL2 + SDL2_ttf
+
+REQ_MISSING=
+if pkg-config --exists sdl2 2>/dev/null; then
+	SDL2_VER=$(pkg-config --modversion sdl2 2>/dev/null)
+	ok "SDL2 ${SDL2_VER:-found}"
+else
+	err "SDL2 development files not found"
+	REQ_MISSING="$REQ_MISSING sdl2"
+fi
+
+SDL2_TTF_OK=false
+if pkg-config --exists SDL2_ttf 2>/dev/null; then
+	SDL2_TTF_VER=$(pkg-config --modversion SDL2_ttf 2>/dev/null)
+	ok "SDL2_ttf ${SDL2_TTF_VER:-found}"
+	SDL2_TTF_OK=true
+else
+	# Some distros (older Debian) don't ship a .pc file for SDL2_ttf;
+	# fall back to scanning the SDL2 include path for SDL_ttf.h.
+	if pkg-config --exists sdl2 2>/dev/null; then
+		SDL2_INCDIRS=$(pkg-config --cflags-only-I sdl2 2>/dev/null \
+			| sed 's/-I//g')
+		for _d in $SDL2_INCDIRS /usr/include /usr/include/SDL2 \
+			/usr/local/include /usr/local/include/SDL2; do
+			if [ -f "$_d/SDL_ttf.h" ]; then
+				ok "SDL2_ttf found via header at $_d/SDL_ttf.h"
+				SDL2_TTF_OK=true
+				break
+			fi
+		done
+	fi
+	if ! $SDL2_TTF_OK; then
+		err "SDL2_ttf development files not found"
+		REQ_MISSING="$REQ_MISSING sdl2_ttf"
+	fi
+fi
+
+# Optional: ALSA / JACK / OSS
+
+ALSA_LIB_OK=false
+if pkg-config --exists alsa 2>/dev/null; then
+	ALSA_LIB_OK=true
+	ok "ALSA library ($(pkg-config --modversion alsa 2>/dev/null))"
+else
+	info "ALSA library : not found"
+fi
+
+JACK_LIB_OK=false
+if pkg-config --exists jack 2>/dev/null; then
+	JACK_LIB_OK=true
+	ok "JACK library ($(pkg-config --modversion jack 2>/dev/null))"
+else
+	info "JACK library : not found"
+fi
+
+OSS_LIB_OK=false
+for _h in /usr/include/sys/soundcard.h /usr/local/include/sys/soundcard.h; do
+	if [ -f "$_h" ]; then
+		OSS_LIB_OK=true
+		break
+	fi
+done
+if $OSS_LIB_OK; then
+	ok "OSS soundcard.h header"
+else
+	info "OSS headers  : not found"
+fi
+
+if [ -n "$REQ_MISSING" ]; then
+	echo
+	err "missing required dependencies; cannot continue."
+	echo
+	for _m in $REQ_MISSING; do
+		printf '  %s : %s\n' "$_m" "$(pkg_install_hint "$_m")"
+	done
+	exit 1
+fi
+
+# ---- Section 3: Hardware enumeration ---------------------------------------
+
+heading "Audio hardware"
+
+ALSA_HAS_HW=false
+ALSA_DEVICE_LINES=
+if command -v aplay >/dev/null 2>&1; then
+	ALSA_LIST=$(aplay -l 2>/dev/null | grep -E '^card [0-9]+' || true)
+	if [ -n "$ALSA_LIST" ]; then
+		ALSA_HAS_HW=true
+		info "ALSA playback devices:"
+		printf '%s\n' "$ALSA_LIST" | while IFS= read -r _line; do
+			printf '    %s\n' "$_line"
+		done
+		ALSA_DEVICE_LINES=$ALSA_LIST
+	else
+		info "ALSA: no playback cards reported by aplay -l"
+	fi
+	if command -v arecord >/dev/null 2>&1; then
+		ALSA_REC=$(arecord -l 2>/dev/null | grep -E '^card [0-9]+' || true)
+		if [ -n "$ALSA_REC" ]; then
+			info "ALSA capture devices:"
+			printf '%s\n' "$ALSA_REC" | while IFS= read -r _line; do
+				printf '    %s\n' "$_line"
+			done
+		fi
+	fi
+else
+	info "ALSA: aplay not installed; skipping hardware enumeration"
+fi
+
+JACK_RUNNING=false
+if command -v jack_control >/dev/null 2>&1; then
+	if jack_control status 2>/dev/null | grep -qi started; then
+		JACK_RUNNING=true
+	fi
+fi
+if ! $JACK_RUNNING && command -v pgrep >/dev/null 2>&1; then
+	if pgrep -x jackd >/dev/null 2>&1 \
+		|| pgrep -f pipewire-jack >/dev/null 2>&1 \
+		|| pgrep -x pipewire >/dev/null 2>&1; then
+		JACK_RUNNING=true
+	fi
+fi
+if $JACK_RUNNING; then
+	info "JACK: server is running (or PipeWire JACK shim active)"
+else
+	info "JACK: no server running"
+fi
+
+OSS_HAS_HW=false
+OSS_DEVICES=
+for _d in /dev/dsp /dev/dsp0 /dev/dsp1 /dev/dsp2 /dev/sound/dsp \
+	/dev/sound/dsp0 /dev/sound/dsp1; do
+	if [ -e "$_d" ]; then
+		OSS_HAS_HW=true
+		OSS_DEVICES="$OSS_DEVICES $_d"
+	fi
+done
+if $OSS_HAS_HW; then
+	info "OSS device nodes:$OSS_DEVICES"
+else
+	info "OSS: no /dev/dsp* nodes present"
+fi
+
+# ---- Section 4: Interactive confirmation -----------------------------------
+
+heading "Choose configuration"
+
+# Smart defaults: Y if both library AND any matching hardware are present.
+
+if $ALSA_LIB_OK && $ALSA_HAS_HW; then
+	_def_alsa=Y
+elif $ALSA_LIB_OK; then
+	_def_alsa=Y
+else
+	_def_alsa=N
+fi
+ask_yn "Enable ALSA backend?" "$_def_alsa"
+ENABLE_ALSA=$REPLY
+
+if $JACK_LIB_OK && $JACK_RUNNING; then
+	_def_jack=Y
+elif $JACK_LIB_OK; then
+	_def_jack=N
+else
+	_def_jack=N
+fi
+ask_yn "Enable JACK backend?" "$_def_jack"
+ENABLE_JACK=$REPLY
+
+if $OSS_LIB_OK && $OSS_HAS_HW; then
+	_def_oss=Y
+else
+	_def_oss=N
+fi
+ask_yn "Enable OSS backend?" "$_def_oss"
+ENABLE_OSS=$REPLY
+
+if [ "$ENABLE_ALSA" = n ] && [ "$ENABLE_JACK" = n ] && [ "$ENABLE_OSS" = n ]; then
+	warn "no audio backend selected; xwax will build but won't be able to open any audio device."
+	ask_yn "Continue anyway?" "N"
+	if [ "$REPLY" != y ]; then
+		exit 1
+	fi
+fi
+
+ENABLE_PI4=n
+if $PI4_DETECTED; then
+	ask_yn "Enable Raspberry Pi 4 CPU optimizations?" "Y"
+	ENABLE_PI4=$REPLY
+fi
+
+ask_choice "Build type?" "release" release debug profile
+BUILD_TYPE=$REPLY
+
+if [ "$(id -u)" -eq 0 ]; then
+	_def_prefix=/usr/local
+else
+	_def_prefix=/usr/local
+fi
+ask_str "Install prefix?" "$_def_prefix"
+PREFIX=$REPLY
+
+if [ "$(id -u)" -ne 0 ]; then
+	case $PREFIX in
+		"$HOME"|"$HOME"/*)
+			INSTALL_NEEDS_SUDO=false ;;
+		*)
+			INSTALL_NEEDS_SUDO=true
+			warn "prefix $PREFIX is outside \$HOME; 'make install' will need sudo." ;;
+	esac
+else
+	INSTALL_NEEDS_SUDO=false
+fi
+
+# ---- Section 5: Write .config (delegate to ./configure) --------------------
+
+heading "Writing .config"
+
+CONFIGURE_ARGS="--prefix $PREFIX"
+[ "$ENABLE_ALSA" = y ] && CONFIGURE_ARGS="$CONFIGURE_ARGS --enable-alsa"
+[ "$ENABLE_JACK" = y ] && CONFIGURE_ARGS="$CONFIGURE_ARGS --enable-jack"
+[ "$ENABLE_OSS"  = y ] && CONFIGURE_ARGS="$CONFIGURE_ARGS --enable-oss"
+[ "$ENABLE_PI4"  = y ] && CONFIGURE_ARGS="$CONFIGURE_ARGS --enable-pi4"
+case $BUILD_TYPE in
+	debug)   CONFIGURE_ARGS="$CONFIGURE_ARGS --debug" ;;
+	profile) CONFIGURE_ARGS="$CONFIGURE_ARGS --profile" ;;
+esac
+
+info "running: ./configure $CONFIGURE_ARGS"
+# shellcheck disable=SC2086
+sh ./configure $CONFIGURE_ARGS || die "./configure failed"
+
+# ---- Section 6: Build & install --------------------------------------------
+
+heading "Build"
+
+if command -v nproc >/dev/null 2>&1; then
+	JOBS=$(nproc)
+else
+	JOBS=2
+fi
+info "parallel jobs: $JOBS"
+
+ask_yn "Run 'make clean && make -j$JOBS' now?" "Y"
+if [ "$REPLY" = y ]; then
+	make clean || die "make clean failed"
+	make -j"$JOBS" || die "make failed"
+	ok "build complete: $(ls -l xwax 2>/dev/null | awk '{print $5}') bytes"
+	BUILT=true
+else
+	BUILT=false
+	info "skipping build; you can run 'make -j$JOBS' yourself later."
+fi
+
+INSTALLED=false
+if $BUILT; then
+	heading "Install"
+	if $INSTALL_NEEDS_SUDO; then
+		info "install command will be: sudo make install"
+		if ! command -v sudo >/dev/null 2>&1; then
+			warn "sudo not found; re-run as root to install to $PREFIX, or pick a prefix under \$HOME."
+		else
+			ask_yn "Install to $PREFIX (will run sudo)?" "Y"
+			if [ "$REPLY" = y ]; then
+				sudo make install || die "sudo make install failed"
+				INSTALLED=true
+			fi
+		fi
+	else
+		ask_yn "Install to $PREFIX?" "Y"
+		if [ "$REPLY" = y ]; then
+			make install || die "make install failed"
+			INSTALLED=true
+		fi
+	fi
+fi
+
+# ---- Section 7: Streaming integration --------------------------------------
+
+heading "Streaming sources (SoundCloud / Spotify)"
+
+ask_yn "Set up streaming source helpers (scan-soundcloud, scan-spotify, import-streaming)?" "Y"
+DO_STREAMING=$REPLY
+
+STREAMING_VENV=""
+STREAMING_VENV_BUILT=false
+STREAMING_ENV_FILE=""
+SPOTIFY_CONFIGURED=false
+LIBRESPOT_OK=false
+LIBRESPOT_HAS_SINGLE_TRACK=false
+
+if [ "$DO_STREAMING" = y ]; then
+
+	# 7a. System tool detection (detect-only)
+
+	info "checking system tools..."
+	for _tool in ffmpeg yt-dlp jq; do
+		if command -v "$_tool" >/dev/null 2>&1; then
+			ok "$_tool: $(command -v "$_tool")"
+		else
+			warn "$_tool not found  ->  $(pkg_install_hint "$_tool")"
+		fi
+	done
+
+	if command -v librespot >/dev/null 2>&1; then
+		LIBRESPOT_OK=true
+		ok "librespot: $(command -v librespot)"
+		if librespot --help 2>&1 | grep -q -- '--single-track'; then
+			LIBRESPOT_HAS_SINGLE_TRACK=true
+			ok "librespot supports --single-track"
+		else
+			warn "librespot is installed but does not support --single-track."
+			info "  Install a recent build: $(pkg_install_hint librespot)"
+		fi
+	else
+		warn "librespot not found  ->  $(pkg_install_hint librespot)"
+	fi
+
+	# 7b. Python venv for scan-spotify
+
+	if command -v python3 >/dev/null 2>&1 \
+		&& python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,8) else 1)' >/dev/null 2>&1 \
+		&& python3 -c 'import venv' >/dev/null 2>&1; then
+
+		_xdg_data=${XDG_DATA_HOME:-$HOME/.local/share}
+		STREAMING_VENV="$_xdg_data/xwax/streaming-venv"
+
+		if [ -x "$STREAMING_VENV/bin/python3" ]; then
+			info "existing venv at $STREAMING_VENV"
+			ask_yn "Upgrade spotipy in existing venv?" "Y"
+			_do_venv=$REPLY
+		else
+			ask_yn "Create Python venv at $STREAMING_VENV (for scan-spotify)?" "Y"
+			_do_venv=$REPLY
+		fi
+
+		if [ "$_do_venv" = y ]; then
+			mkdir -p "$(dirname "$STREAMING_VENV")" \
+				|| die "could not create $(dirname "$STREAMING_VENV")"
+			if [ ! -x "$STREAMING_VENV/bin/python3" ]; then
+				info "creating venv..."
+				python3 -m venv "$STREAMING_VENV" \
+					|| die "python3 -m venv failed"
+			fi
+			info "installing spotipy into venv..."
+			"$STREAMING_VENV/bin/pip" install --upgrade pip >/dev/null \
+				|| warn "pip upgrade failed (continuing)"
+			if [ -f requirements-streaming.txt ]; then
+				"$STREAMING_VENV/bin/pip" install --upgrade \
+					-r requirements-streaming.txt \
+					|| die "pip install -r requirements-streaming.txt failed"
+			else
+				"$STREAMING_VENV/bin/pip" install --upgrade 'spotipy>=2.23' \
+					|| die "pip install spotipy failed"
+			fi
+			STREAMING_VENV_BUILT=true
+			ok "venv ready at $STREAMING_VENV"
+		else
+			info "skipping venv creation; scan-spotify will fall back to system python3."
+		fi
+	else
+		warn "python3 (>=3.8) with venv not available  ->  $(pkg_install_hint venv)"
+		info "skipping venv setup; scan-spotify needs spotipy installed somewhere."
+	fi
+
+	# 7d. Make streaming scripts executable
+
+	for _s in scan-soundcloud scan-spotify import-streaming; do
+		if [ -f "$_s" ]; then
+			if [ ! -x "$_s" ]; then
+				chmod +x "$_s" 2>/dev/null \
+					&& ok "chmod +x $_s" \
+					|| warn "could not chmod +x $_s"
+			else
+				ok "$_s already executable"
+			fi
+		else
+			warn "$_s not present in source tree"
+		fi
+	done
+
+	# 7e. Spotify client id capture
+
+	echo
+	info "Spotify Web API needs a free 'client id' to scan playlists."
+	info "Register an app at https://developer.spotify.com/dashboard"
+	info "and set its redirect URI to http://localhost:8888/callback."
+	ask_str "Spotify SPOTIFY_CLIENT_ID (leave blank to skip):" ""
+	_client_id=$REPLY
+
+	if [ -n "$_client_id" ]; then
+		_xdg_config=${XDG_CONFIG_HOME:-$HOME/.config}
+		STREAMING_ENV_FILE="$_xdg_config/xwax/streaming.env"
+		mkdir -p "$(dirname "$STREAMING_ENV_FILE")" \
+			|| die "could not create $(dirname "$STREAMING_ENV_FILE")"
+
+		_tmp="$STREAMING_ENV_FILE.tmp.$$"
+		{
+			printf '# xwax streaming environment\n'
+			printf '# Source this before launching xwax with -s ./scan-spotify:\n'
+			printf '#   . %s\n' "$STREAMING_ENV_FILE"
+			printf '#\n'
+			printf '# Generated by install-wizard on %s\n' "$(date -Iseconds 2>/dev/null || date)"
+			printf '\n'
+			printf 'export SPOTIFY_CLIENT_ID=%s\n' "\"$_client_id\""
+			printf '\n'
+			printf '# Optional override; defaults to http://localhost:8888/callback\n'
+			printf '# export SPOTIFY_REDIRECT_URI="http://localhost:8888/callback"\n'
+		} > "$_tmp" || die "could not write $_tmp"
+		mv "$_tmp" "$STREAMING_ENV_FILE" \
+			|| die "could not move $_tmp to $STREAMING_ENV_FILE"
+		chmod 0600 "$STREAMING_ENV_FILE" 2>/dev/null || true
+		SPOTIFY_CONFIGURED=true
+		ok "wrote $STREAMING_ENV_FILE (mode 0600)"
+	else
+		info "no client id entered; skipping streaming.env."
+	fi
+fi
+
+# ---- Section 8: Summary -----------------------------------------------------
+
+heading "Summary"
+
+if $BUILT; then
+	if [ -x ./xwax ]; then
+		info "binary built : $WIZARD_DIR/xwax"
+	fi
+fi
+if $INSTALLED; then
+	info "installed to : $PREFIX/bin/xwax"
+	info "man page     : $PREFIX/share/man/man1/xwax.1"
+	XWAX_INVOKE="xwax"
+elif $BUILT; then
+	XWAX_INVOKE="./xwax"
+else
+	XWAX_INVOKE="./xwax"
+fi
+
+echo
+info "Detected audio devices and example invocations:"
+echo
+
+if [ "$ENABLE_ALSA" = y ] && $ALSA_HAS_HW; then
+	printf '  %sALSA cards%s\n' "$C_BOLD" "$C_RESET"
+	# Use a temp file to extract first ALSA card; while-loops in pipes
+	# run in subshells, which complicates capturing a value.
+	_first_card=$(printf '%s\n' "$ALSA_DEVICE_LINES" \
+		| sed -n 's/^card \([0-9][0-9]*\):.*/\1/p' | head -n1)
+	printf '%s\n' "$ALSA_DEVICE_LINES" | while IFS= read -r _line; do
+		printf '    %s\n' "$_line"
+	done
+	if [ -n "$_first_card" ]; then
+		printf '    example: %s -a hw:%s,0\n' "$XWAX_INVOKE" "$_first_card"
+	fi
+fi
+
+if [ "$ENABLE_JACK" = y ]; then
+	printf '  %sJACK%s\n' "$C_BOLD" "$C_RESET"
+	if $JACK_RUNNING; then
+		printf '    server: running\n'
+	else
+		printf '    server: not running (start jackd or pipewire-jack first)\n'
+	fi
+	printf '    example: %s -j xwax-deck-1\n' "$XWAX_INVOKE"
+fi
+
+if [ "$ENABLE_OSS" = y ] && $OSS_HAS_HW; then
+	printf '  %sOSS%s\n' "$C_BOLD" "$C_RESET"
+	for _d in $OSS_DEVICES; do
+		printf '    %s\n' "$_d"
+	done
+	_first_oss=$(printf '%s' "$OSS_DEVICES" | awk '{print $1}')
+	if [ -n "$_first_oss" ]; then
+		printf '    example: %s -d %s\n' "$XWAX_INVOKE" "$_first_oss"
+	fi
+fi
+
+if [ "$DO_STREAMING" = y ]; then
+	echo
+	printf '  %sStreaming%s\n' "$C_BOLD" "$C_RESET"
+	if $STREAMING_VENV_BUILT; then
+		printf '    venv         : %s\n' "$STREAMING_VENV"
+	fi
+	if $SPOTIFY_CONFIGURED; then
+		printf '    env file     : %s\n' "$STREAMING_ENV_FILE"
+		printf '    source it    : . %s\n' "$STREAMING_ENV_FILE"
+	fi
+	if ! $LIBRESPOT_HAS_SINGLE_TRACK; then
+		printf '    note         : install a recent librespot before using -s ./scan-spotify\n'
+	fi
+	if $LIBRESPOT_OK; then
+		printf '    librespot pairing (one-time, see README-streaming.md):\n'
+		printf '      librespot --name "xwax-test"\n'
+		printf '      then pick "xwax-test" in the official Spotify app -> Connect to a device\n'
+	fi
+	printf '    example combined launch:\n'
+	printf '      %s \\\n' "$XWAX_INVOKE"
+	printf '        -i ./import-streaming \\\n'
+	printf '        -s ./scan            -l ~/music \\\n'
+	printf '        -s ./scan-soundcloud -l '\''https://soundcloud.com/yourname/likes'\'' \\\n'
+	printf '        -s ./scan-spotify    -l liked \\\n'
+	if [ "$ENABLE_ALSA" = y ] && [ -n "${_first_card:-}" ]; then
+		printf '        -a hw:%s,0\n' "$_first_card"
+	else
+		printf '        -a hw:0,0\n'
+	fi
+fi
+
+echo
+ok "all done."
+echo

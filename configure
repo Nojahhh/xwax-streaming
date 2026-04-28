@@ -32,6 +32,12 @@ Options:
   --enable-pi4     Optimize for Raspberry Pi 4 (ARM Cortex-A72)
   --debug          Debug build
   --profile        Profile build
+
+For an interactive setup that auto-detects audio interfaces, libraries,
+and CPU, then drives make/make install (and optionally sets up the
+streaming integration), run:
+
+  ./install-wizard
 EOF
 }
 

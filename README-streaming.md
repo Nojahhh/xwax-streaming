@@ -16,6 +16,24 @@ points, BPM, overview meter) keeps working unchanged.
 
 ## Install
 
+### The easy way: `./install-wizard`
+
+```bash
+./install-wizard
+```
+
+The Linux install wizard at the repo root detects which streaming
+tools are present, offers to create a Python venv for `scan-spotify`
+at `~/.local/share/xwax/streaming-venv`, makes the streaming scripts
+executable, and writes `~/.config/xwax/streaming.env` with your
+Spotify client id (so you can `source` it before launching xwax).
+
+It does *not* install distro packages for you (`ffmpeg`, `yt-dlp`,
+`jq`, `librespot`) — it tells you which are missing and prints the
+right command for your distro.
+
+### Manual setup
+
 System packages (install with your distro's package manager):
 
 | Tool      | Used for                              | Required if you use   |
@@ -36,6 +54,11 @@ Then make the scripts executable:
 ```bash
 chmod +x scan-soundcloud scan-spotify import-streaming
 ```
+
+`scan-spotify` ships with a polyglot `/bin/sh` + Python shebang that
+auto-uses the wizard's venv at `~/.local/share/xwax/streaming-venv` if
+present, otherwise falls back to system `python3`. You can override
+the interpreter with `XWAX_STREAMING_PY=/path/to/python ./scan-spotify ...`.
 
 ## Authentication
 

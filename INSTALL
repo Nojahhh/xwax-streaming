@@ -1,6 +1,26 @@
-The recommended way to build xwax is to run "make" with your chosen
-compile options, followed optionally by "make install" to install at
-the given prefix; eg.
+EASIEST: run the interactive Linux wizard
+------------------------------------------
+
+  $ ./install-wizard
+
+It probes your distro, CPU, audio interfaces, and libraries, then
+drives configure / make / make install with confirmation at every
+step. It can also set up the streaming integration (SoundCloud /
+Spotify): detect ffmpeg/yt-dlp/jq/librespot, create a Python venv for
+scan-spotify, and capture your Spotify client id. See the README and
+README-streaming.md for what those features do.
+
+The wizard is interactive only. The manual flow below stays available
+for scripted / non-Linux setups and for power users who want full
+control.
+
+
+Manual / advanced build
+-----------------------
+
+The recommended way to build xwax manually is to run "make" with your
+chosen compile options, followed optionally by "make install" to
+install at the given prefix; eg.
 
   $ make PREFIX=/usr ALSA=yes
   $ make PREFIX=/usr ALSA=yes install  # as root

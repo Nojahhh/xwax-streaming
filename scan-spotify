@@ -1,4 +1,18 @@
-#!/usr/bin/env python3
+#!/bin/sh
+""":"
+# This is a /bin/sh + python3 polyglot.
+# When invoked as a program, /bin/sh runs the lines below first; they
+# choose a Python interpreter (preferring the wizard's venv if present)
+# and re-exec the same file. Once Python takes over, the whole sh block
+# is a no-op string expression and the rest of the file is plain Python.
+#
+# Override with: XWAX_STREAMING_PY=/path/to/python ./scan-spotify ...
+PY="${XWAX_STREAMING_PY:-}"
+if [ -z "$PY" ] && [ -x "$HOME/.local/share/xwax/streaming-venv/bin/python3" ]; then
+    PY="$HOME/.local/share/xwax/streaming-venv/bin/python3"
+fi
+exec "${PY:-python3}" "$0" "$@"
+":"""
 """scan-spotify: xwax library scanner for Spotify playlists/albums/saved tracks.
 
 Emits xwax scan-format lines on stdout:
@@ -25,6 +39,8 @@ Environment:
                           registered in the Spotify dashboard.
                           Default: http://localhost:8888/callback
     XDG_CACHE_HOME        Used for the auth-token cache file.
+    XWAX_STREAMING_PY     Override the Python interpreter the polyglot
+                          shebang uses (advanced).
 """
 from __future__ import annotations
 
@@ -39,6 +55,7 @@ try:
 except ImportError:
     sys.stderr.write(
         "scan-spotify: missing dependency 'spotipy'.\n"
+        "  Run ./install-wizard to set up a venv automatically, or:\n"
         "  pip install -r requirements-streaming.txt\n"
     )
     sys.exit(1)
@@ -65,7 +82,8 @@ def make_client() -> spotipy.Spotify:
             "SPOTIFY_CLIENT_ID is not set.\n"
             "  1. Register an app at https://developer.spotify.com/dashboard\n"
             f"  2. Set its redirect URI to {DEFAULT_REDIRECT}\n"
-            "  3. export SPOTIFY_CLIENT_ID=<your-client-id>"
+            "  3. export SPOTIFY_CLIENT_ID=<your-client-id>\n"
+            "     (or run ./install-wizard, which writes ~/.config/xwax/streaming.env)"
         )
 
     redirect_uri = os.environ.get("SPOTIFY_REDIRECT_URI", DEFAULT_REDIRECT)
