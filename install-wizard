@@ -163,8 +163,9 @@ Usage: install-wizard [--help]
 Interactive installer for xwax. Probes audio backends, libraries, and
 hardware on the local Linux host, then drives configure/make/install
 with confirmation at each step. Also offers to set up the streaming
-integration (ffmpeg/yt-dlp/jq/librespot detection, Python venv for
-scan-spotify, Spotify client id capture).
+integration (ffmpeg/yt-dlp/jq detection, spotty fork of librespot for
+Spotify --single-track support, Python venv for scan-spotify, Spotify
+client id capture).
 
 For non-interactive / scripted setups use ./configure directly.
 
@@ -215,6 +216,87 @@ if [ -n "$MISSING_TOOLS" ]; then
 	exit 1
 fi
 ok "build tools present (make, cc/gcc, pkg-config)"
+
+# Refuse to run the whole wizard under sudo. Building xwax does not need
+# root, and doing so leaves root-owned .config / .version / *.o files in
+# the source tree that block any future non-root run. The install step
+# acquires sudo on its own when the prefix is outside $HOME.
+
+if [ "$(id -u)" -eq 0 ]; then
+	if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+		err "this wizard is being run via sudo (SUDO_USER=$SUDO_USER)."
+		info "Run it as your normal user instead:"
+		info "    ./install-wizard"
+		info "The wizard will call 'sudo make install' itself only when"
+		info "the install prefix is outside your home directory."
+		info ""
+		info "If you have already run it under sudo and it left root-owned"
+		info "files behind, clean them up first with:"
+		info "    sudo rm -f .config .version *.o tests/*.o xwax mktimecode"
+		exit 1
+	fi
+	warn "running as the real root user (no SUDO_USER set)."
+	warn "If this is intentional, continuing; otherwise hit Ctrl-C now."
+fi
+
+# Ensure the build helper scripts in the source tree are executable.
+# Some clone paths (zip downloads, copying through Windows / non-POSIX
+# filesystems) drop the execute bit, which then breaks './mkversion'
+# from inside the Makefile and './configure' from this wizard.
+
+_build_helpers="configure mkversion mkdist scan import"
+_chmod_done=
+for _h in $_build_helpers; do
+	if [ -f "$_h" ] && [ ! -x "$_h" ]; then
+		if chmod +x "$_h" 2>/dev/null; then
+			_chmod_done="$_chmod_done $_h"
+		else
+			err "$_h is not executable and chmod +x failed (insufficient permission)."
+			info "It may be owned by root from a previous sudo run. Try:"
+			info "    sudo chown -R \"\$USER\":\"\$USER\" ."
+			info "    chmod +x$_build_helpers"
+			exit 1
+		fi
+	fi
+done
+if [ -n "$_chmod_done" ]; then
+	ok "made build helpers executable:$_chmod_done"
+else
+	ok "build helpers already executable"
+fi
+
+# Detect stale root-owned source-tree artefacts left over from a previous
+# 'sudo' run. These prevent ./configure from rewriting .config and break
+# 'make' / 'make clean' for the current user.
+
+_stale_root=
+if [ "$(id -u)" -ne 0 ]; then
+	for _f in .config .version; do
+		if [ -e "$_f" ] && [ ! -w "$_f" ]; then
+			_stale_root="$_stale_root $_f"
+		fi
+	done
+fi
+if [ -n "$_stale_root" ]; then
+	warn "found files in the source tree you cannot write to (likely from a previous sudo run):$_stale_root"
+	if command -v sudo >/dev/null 2>&1; then
+		ask_yn "Remove them with sudo so this wizard can proceed?" "Y"
+		if [ "$REPLY" = y ]; then
+			# shellcheck disable=SC2086
+			sudo rm -f $_stale_root || die "could not remove stale files; aborting."
+			# Also clear any root-owned object files lurking in the tree.
+			# 'make clean' would re-create them, but we want the build to
+			# run under the current user, not error out on writes.
+			sudo find . -maxdepth 2 -name '*.o' -user 0 -exec rm -f {} + 2>/dev/null || true
+			sudo find . -maxdepth 2 -name '*.d' -user 0 -exec rm -f {} + 2>/dev/null || true
+			ok "removed stale root-owned files"
+		else
+			die "aborting; please run 'sudo rm -f$_stale_root' manually and rerun."
+		fi
+	else
+		die "sudo not available; remove these files manually as root and rerun: $_stale_root"
+	fi
+fi
 
 # ---- Section 2: System probe ------------------------------------------------
 
@@ -291,6 +373,14 @@ pkg_install_hint() {
 				opensuse*|sles)                       printf 'sudo zypper install ffmpeg' ;;
 				*)                                    printf 'install ffmpeg' ;;
 			esac ;;
+		mpg123)
+			case $DISTRO_ID in
+				debian|ubuntu|raspbian|linuxmint|pop) printf 'sudo apt install mpg123' ;;
+				fedora|rhel|centos|rocky|almalinux)   printf 'sudo dnf install mpg123' ;;
+				arch|manjaro|endeavouros)             printf 'sudo pacman -S mpg123' ;;
+				opensuse*|sles)                       printf 'sudo zypper install mpg123' ;;
+				*)                                    printf 'install mpg123' ;;
+			esac ;;
 		yt-dlp)
 			case $DISTRO_ID in
 				debian|ubuntu|raspbian|linuxmint|pop) printf 'sudo apt install yt-dlp  (or: pipx install yt-dlp)' ;;
@@ -308,7 +398,7 @@ pkg_install_hint() {
 				*)                                    printf 'install jq' ;;
 			esac ;;
 		librespot)
-			printf 'cargo install librespot   (recommended; distro packages are often outdated)' ;;
+			printf 'cargo install --git https://github.com/michaelherger/librespot --branch spotty spotty   (the "spotty" librespot fork; mainline lacks --single-track)' ;;
 		venv)
 			case $DISTRO_ID in
 				debian|ubuntu|raspbian|linuxmint|pop) printf 'sudo apt install python3-venv python3-pip' ;;
@@ -463,38 +553,104 @@ else
 	info "OSS: no /dev/dsp* nodes present"
 fi
 
+# ---- Section 3b: Runtime media decoders ------------------------------------
+#
+# These are runtime helpers shelled out to by the stock 'import' script
+# that ships with xwax (xwax/import in the source tree). They are
+# independent of the streaming integration:
+#
+#   mpg123  - decodes local .mp3 files
+#   ffmpeg  - fallback decoder for everything else (FLAC, WAV, AAC, ...)
+#             and also used by import-streaming for resampling and the
+#             yt-dlp pipe.
+#
+# We probe and warn unconditionally because xwax cannot play any local
+# library track without at least one of these. Streaming-specific tools
+# (yt-dlp, jq, spotty/librespot) are still handled later, only when the
+# user opts into the streaming setup.
+
+heading "Runtime media decoders"
+
+info "checking decoders used by the stock import script..."
+for _tool in mpg123 ffmpeg; do
+	if command -v "$_tool" >/dev/null 2>&1; then
+		ok "$_tool: $(command -v "$_tool")"
+	else
+		case $_tool in
+			mpg123) _why="needed to decode local .mp3 files" ;;
+			ffmpeg) _why="needed to decode non-mp3 local files (and used by import-streaming)" ;;
+		esac
+		warn "$_tool not found ($_why)"
+		info "    install: $(pkg_install_hint "$_tool")"
+	fi
+done
+
 # ---- Section 4: Interactive confirmation -----------------------------------
 
 heading "Choose configuration"
 
 # Smart defaults: Y if both library AND any matching hardware are present.
 
-if $ALSA_LIB_OK && $ALSA_HAS_HW; then
-	_def_alsa=Y
-elif $ALSA_LIB_OK; then
-	_def_alsa=Y
-else
-	_def_alsa=N
-fi
-ask_yn "Enable ALSA backend?" "$_def_alsa"
+# ask_backend BACKEND_NAME LIB_OK HW_HINT INSTALL_HINT_TOKEN -> sets REPLY=y/n
+# Loops until the user either says n, or says y AND the dev library is
+# present. Prevents the build from compiling, say, jack.c without
+# jack/jack.h.
+
+ask_backend() {
+	_name=$1
+	_lib_ok=$2
+	_hw_hint=$3
+	_hint_token=$4
+	if $_lib_ok && [ "$_hw_hint" = hw ]; then
+		_def=Y
+	elif $_lib_ok; then
+		_def=Y
+	else
+		_def=N
+	fi
+	while :; do
+		ask_yn "Enable $_name backend?" "$_def"
+		if [ "$REPLY" = n ]; then
+			return 0
+		fi
+		if $_lib_ok; then
+			return 0
+		fi
+		err "$_name dev library not found; cannot enable this backend."
+		info "    install : $(pkg_install_hint "$_hint_token")"
+		info "    then re-run ./install-wizard"
+		ask_yn "Re-prompt for $_name (after you install the headers in another terminal)?" "N"
+		if [ "$REPLY" != y ]; then
+			REPLY=n
+			return 0
+		fi
+		# Re-probe so the next pass reflects what the user just installed.
+		case $_hint_token in
+			alsa) pkg-config --exists alsa 2>/dev/null && _lib_ok=true ;;
+			jack) pkg-config --exists jack 2>/dev/null && _lib_ok=true ;;
+			oss)
+				for _h in /usr/include/sys/soundcard.h \
+					/usr/local/include/sys/soundcard.h; do
+					[ -f "$_h" ] && _lib_ok=true && break
+				done
+				;;
+		esac
+	done
+}
+
+_alsa_hw_hint=no
+$ALSA_HAS_HW && _alsa_hw_hint=hw
+ask_backend ALSA "$ALSA_LIB_OK" "$_alsa_hw_hint" alsa
 ENABLE_ALSA=$REPLY
 
-if $JACK_LIB_OK && $JACK_RUNNING; then
-	_def_jack=Y
-elif $JACK_LIB_OK; then
-	_def_jack=N
-else
-	_def_jack=N
-fi
-ask_yn "Enable JACK backend?" "$_def_jack"
+_jack_hw_hint=no
+$JACK_RUNNING && _jack_hw_hint=hw
+ask_backend JACK "$JACK_LIB_OK" "$_jack_hw_hint" jack
 ENABLE_JACK=$REPLY
 
-if $OSS_LIB_OK && $OSS_HAS_HW; then
-	_def_oss=Y
-else
-	_def_oss=N
-fi
-ask_yn "Enable OSS backend?" "$_def_oss"
+_oss_hw_hint=no
+$OSS_HAS_HW && _oss_hw_hint=hw
+ask_backend OSS "$OSS_LIB_OK" "$_oss_hw_hint" oss
 ENABLE_OSS=$REPLY
 
 if [ "$ENABLE_ALSA" = n ] && [ "$ENABLE_JACK" = n ] && [ "$ENABLE_OSS" = n ]; then
@@ -610,13 +766,64 @@ STREAMING_ENV_FILE=""
 SPOTIFY_CONFIGURED=false
 LIBRESPOT_OK=false
 LIBRESPOT_HAS_SINGLE_TRACK=false
+LIBRESPOT_BIN=""
+LIBRESPOT_BIN_NAME=""
+LIBRESPOT_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/xwax/librespot"
+LIBRESPOT_PAIRED=false
+
+# Probe for a librespot-family binary in PATH and confirm it supports
+# --single-track. We prefer 'spotty' (the michaelherger/librespot fork)
+# because mainline librespot does NOT ship --single-track; only the
+# spotty fork does. If only mainline 'librespot' is on PATH it will be
+# detected but flagged as unable to drive import-streaming.
+#
+# Sets:
+#   LIBRESPOT_OK              true if any binary was found
+#   LIBRESPOT_HAS_SINGLE_TRACK true if that binary supports --single-track
+#   LIBRESPOT_BIN             absolute path to the chosen binary
+#   LIBRESPOT_BIN_NAME        'spotty' or 'librespot'
+probe_librespot() {
+	LIBRESPOT_OK=false
+	LIBRESPOT_HAS_SINGLE_TRACK=false
+	LIBRESPOT_BIN=""
+	LIBRESPOT_BIN_NAME=""
+
+	# Try spotty first; fall back to mainline librespot. Whichever has
+	# --single-track wins; if neither does, we still record the binary
+	# we found so the summary can be honest about it.
+	for _cand in spotty librespot; do
+		if command -v "$_cand" >/dev/null 2>&1; then
+			_path=$(command -v "$_cand")
+			if "$_cand" --help 2>&1 | grep -q -- '--single-track'; then
+				LIBRESPOT_OK=true
+				LIBRESPOT_HAS_SINGLE_TRACK=true
+				LIBRESPOT_BIN=$_path
+				LIBRESPOT_BIN_NAME=$_cand
+				return 0
+			fi
+			# Remember the first found binary even if it lacks
+			# --single-track, so the user gets a meaningful message
+			# rather than "not installed".
+			if [ -z "$LIBRESPOT_BIN" ]; then
+				LIBRESPOT_OK=true
+				LIBRESPOT_BIN=$_path
+				LIBRESPOT_BIN_NAME=$_cand
+			fi
+		fi
+	done
+}
 
 if [ "$DO_STREAMING" = y ]; then
 
-	# 7a. System tool detection (detect-only)
+	# 7a. System tool detection (detect-only for yt-dlp/jq).
+	#
+	# ffmpeg is intentionally NOT re-checked here: it's already probed
+	# in Section 3b ("Runtime media decoders") because the stock import
+	# script needs it for non-mp3 files even when streaming is disabled.
+	# We only check the streaming-specific extras here.
 
-	info "checking system tools..."
-	for _tool in ffmpeg yt-dlp jq; do
+	info "checking streaming-only system tools..."
+	for _tool in yt-dlp jq; do
 		if command -v "$_tool" >/dev/null 2>&1; then
 			ok "$_tool: $(command -v "$_tool")"
 		else
@@ -624,18 +831,265 @@ if [ "$DO_STREAMING" = y ]; then
 		fi
 	done
 
-	if command -v librespot >/dev/null 2>&1; then
-		LIBRESPOT_OK=true
-		ok "librespot: $(command -v librespot)"
-		if librespot --help 2>&1 | grep -q -- '--single-track'; then
-			LIBRESPOT_HAS_SINGLE_TRACK=true
-			ok "librespot supports --single-track"
+	# librespot: detect, and offer to cargo-install if missing or too old.
+	# We prefer the 'spotty' fork (michaelherger/librespot) because
+	# import-streaming relies on --single-track, which mainline librespot
+	# does not have. Spotty is librespot 0.8.0 + the helper feature flags
+	# from the LMS Spotty plugin (single-track, get-token, etc).
+	probe_librespot
+	if $LIBRESPOT_OK; then
+		ok "$LIBRESPOT_BIN_NAME: $LIBRESPOT_BIN"
+		if $LIBRESPOT_HAS_SINGLE_TRACK; then
+			ok "$LIBRESPOT_BIN_NAME supports --single-track"
 		else
-			warn "librespot is installed but does not support --single-track."
-			info "  Install a recent build: $(pkg_install_hint librespot)"
+			warn "$LIBRESPOT_BIN_NAME does not support --single-track."
+			info "Mainline librespot has never shipped this flag; only the"
+			info "'spotty' fork does. import-streaming can't fetch Spotify"
+			info "tracks without it, so the wizard will offer to install spotty."
 		fi
 	else
-		warn "librespot not found  ->  $(pkg_install_hint librespot)"
+		warn "no librespot-family binary found (looked for: spotty, librespot)"
+	fi
+
+	if ! $LIBRESPOT_OK || ! $LIBRESPOT_HAS_SINGLE_TRACK; then
+		echo
+		info "We install the 'spotty' fork of librespot, which adds the"
+		info "--single-track flag that import-streaming needs to fetch one"
+		info "Spotify URI and exit. Source: https://github.com/michaelherger/librespot"
+		info "(branch 'spotty'). Build dependencies needed: git, pkg-config,"
+		info "libasound2-dev, libssl-dev (Debian/Ubuntu names)."
+		info "On a Raspberry Pi 4 the compile typically takes 20-40 minutes."
+		ask_yn "Install spotty now (clone + cargo install --path)?" "Y"
+		if [ "$REPLY" = y ]; then
+			# If cargo is missing, offer to install rustup first. This
+			# is a recognised third-party install (sh.rustup.rs); we
+			# show the URL up-front so the user is consenting to it.
+			if ! command -v cargo >/dev/null 2>&1; then
+				warn "cargo (the Rust toolchain) is not in PATH."
+				info "Rustup installs the toolchain into ~/.rustup and ~/.cargo"
+				info "(per-user, no sudo needed). The minimal profile is ~250 MB."
+				info "Source: https://sh.rustup.rs (the official rustup installer)."
+				ask_yn "Install Rust via rustup now?" "Y"
+				if [ "$REPLY" = y ]; then
+					if ! command -v curl >/dev/null 2>&1; then
+						err "curl not found; cannot fetch the rustup installer."
+						case $DISTRO_ID in
+							debian|ubuntu|raspbian|linuxmint|pop)
+								info "    sudo apt install curl" ;;
+							fedora|rhel|centos|rocky|almalinux)
+								info "    sudo dnf install curl" ;;
+							arch|manjaro|endeavouros)
+								info "    sudo pacman -S curl" ;;
+							opensuse*|sles)
+								info "    sudo zypper install curl" ;;
+							*)
+								info "    install curl" ;;
+						esac
+					else
+						info "fetching rustup-init from https://sh.rustup.rs ..."
+						if curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+							| sh -s -- -y --default-toolchain stable --profile minimal; then
+							ok "rustup installed."
+							# Source rustup's env file so cargo is on PATH for
+							# the rest of this wizard run. Rustup's installer
+							# also appends the source line to ~/.bashrc /
+							# ~/.profile for future shells.
+							if [ -f "$HOME/.cargo/env" ]; then
+								# shellcheck disable=SC1091
+								. "$HOME/.cargo/env"
+							fi
+							if [ -d "$HOME/.cargo/bin" ]; then
+								case ":$PATH:" in
+									*":$HOME/.cargo/bin:"*) ;;
+									*) PATH="$HOME/.cargo/bin:$PATH" ; export PATH ;;
+								esac
+							fi
+						else
+							err "rustup install failed; see output above."
+						fi
+					fi
+				fi
+			fi
+			if ! command -v cargo >/dev/null 2>&1; then
+				err "cargo still not available; skipping librespot install."
+				info "Re-run ./install-wizard once Rust is installed."
+			else
+				# Pre-flight spotty's native build deps (and git, which
+				# we now use directly to clone the fork). Without this
+				# we'd wait 30+ minutes for cargo to discover via the
+				# openssl-sys crate that libssl-dev isn't installed,
+				# or fail at clone-time without git installed.
+				_librespot_missing=
+				for _pc in openssl alsa; do
+					if ! pkg-config --exists "$_pc" 2>/dev/null; then
+						_librespot_missing="$_librespot_missing $_pc"
+					fi
+				done
+				if ! command -v git >/dev/null 2>&1; then
+					_librespot_missing="$_librespot_missing git"
+				fi
+				if [ -n "$_librespot_missing" ]; then
+					err "spotty build deps missing:$_librespot_missing"
+					case $DISTRO_ID in
+						debian|ubuntu|raspbian|linuxmint|pop)
+							info "    sudo apt install libssl-dev libasound2-dev pkg-config git"
+							;;
+						fedora|rhel|centos|rocky|almalinux)
+							info "    sudo dnf install openssl-devel alsa-lib-devel pkgconf-pkg-config git"
+							;;
+						arch|manjaro|endeavouros)
+							info "    sudo pacman -S openssl alsa-lib pkgconf git"
+							;;
+						opensuse*|sles)
+							info "    sudo zypper install libopenssl-devel alsa-devel pkg-config git"
+							;;
+						*)
+							info "    install openssl + alsa development headers, pkg-config and git"
+							;;
+					esac
+					info "Install those, then re-run ./install-wizard."
+					info "(skipping cargo invocation to avoid a 30+ min wasted compile)"
+				else
+					ok "spotty build deps present (openssl, alsa, git)"
+
+					# spotty's build tree under TMPDIR runs to 2-3 GB.
+					# On Raspberry Pi OS / many systemd defaults, /tmp is a
+					# tmpfs sized around RAM/2 (often <1 GB), and cargo
+					# install dies with ENOSPC. If TMPDIR has <4 GB free,
+					# redirect to a disk-backed scratch dir under XDG_CACHE.
+					_cargo_tmp_override=
+					_tmp_target=${TMPDIR:-/tmp}
+					_tmp_avail_kb=$(df -P "$_tmp_target" 2>/dev/null \
+						| awk 'NR==2 {print $4 + 0}')
+					if [ "${_tmp_avail_kb:-0}" -lt 4194304 ]; then
+						_cargo_tmp_override="${XDG_CACHE_HOME:-$HOME/.cache}/xwax/cargo-tmp"
+						mkdir -p "$_cargo_tmp_override" \
+							|| die "could not create $_cargo_tmp_override"
+						warn "$_tmp_target has only ~$((${_tmp_avail_kb:-0} / 1024)) MB free; cargo would run out of space."
+						info "redirecting TMPDIR to $_cargo_tmp_override (disk-backed)"
+					fi
+
+					# Wrap the cargo invocation in a function so we can run
+					# the same command both with and without the TMPDIR
+					# override without duplicating arg lists.
+					_run_cargo_install() {
+						if [ -n "$_cargo_tmp_override" ]; then
+							TMPDIR="$_cargo_tmp_override" cargo install "$@"
+						else
+							cargo install "$@"
+						fi
+					}
+
+					# Build spotty from a manual git clone instead of
+					# 'cargo install --git'. Reason: the spotty branch
+					# does an unconditional include_str!("client_id.txt")
+					# at compile time, but the file is .gitignore'd
+					# upstream — the maintainer drops in their LMS
+					# plugin's client id during their own builds. Plain
+					# 'cargo install --git' therefore fails with
+					#   error: couldn't read `src/client_id.txt`
+					# We work around it by cloning to a known path,
+					# writing an empty placeholder (spotty falls back
+					# to the runtime --client-id flag if anything actually
+					# needs the value, and our --single-track audio
+					# fetch path doesn't), then using --path so the
+					# patched checkout is what cargo compiles.
+					#
+					# --locked uses the fork's published Cargo.lock so we
+					# get the exact dependency versions the upstream
+					# maintainers tested. Without --locked, librespot
+					# 0.8.0 hits a vergen-lib v0.1 vs v9.x trait clash
+					# that fails the librespot-core build.rs.
+					_spotty_repo='https://github.com/michaelherger/librespot'
+					_spotty_branch='spotty'
+					_spotty_src="${XDG_CACHE_HOME:-$HOME/.cache}/xwax/spotty-src"
+
+					mkdir -p "$(dirname "$_spotty_src")" \
+						|| die "could not create $(dirname "$_spotty_src")"
+
+					if [ -d "$_spotty_src/.git" ]; then
+						info "refreshing existing spotty checkout at $_spotty_src"
+						(
+							cd "$_spotty_src" || exit 1
+							git fetch --depth 1 origin "$_spotty_branch" \
+								&& git checkout -B "$_spotty_branch" \
+									"origin/$_spotty_branch"
+						) || warn "git fetch/checkout in $_spotty_src failed; continuing with the existing checkout"
+					else
+						info "cloning $_spotty_repo (branch $_spotty_branch) -> $_spotty_src"
+						# rm any partial clone so 'git clone' doesn't refuse.
+						rm -rf "$_spotty_src" 2>/dev/null || true
+						if ! git clone --depth 1 \
+								--branch "$_spotty_branch" \
+								"$_spotty_repo" "$_spotty_src"; then
+							err "git clone of spotty failed."
+							info "Check your network and that $_spotty_repo exists."
+							_spotty_src=
+						fi
+					fi
+
+					if [ -n "$_spotty_src" ] && [ -d "$_spotty_src/src" ]; then
+						# The placeholder. Empty content is fine: the
+						# value is consumed only by code paths that
+						# need a Spotify Web API client id (e.g.
+						# --get-token), which import-streaming does
+						# not exercise. Any feature that does need a
+						# real id can be passed via --client-id.
+						if [ ! -f "$_spotty_src/src/client_id.txt" ]; then
+							: > "$_spotty_src/src/client_id.txt" \
+								|| die "could not create $_spotty_src/src/client_id.txt"
+							ok "wrote empty placeholder $_spotty_src/src/client_id.txt"
+						fi
+
+						info "running: cargo install --path $_spotty_src --locked"
+						info "(long; output streams below)"
+						if _run_cargo_install --path "$_spotty_src" --locked; then
+							ok "cargo install spotty completed"
+						else
+							warn "locked install failed; retrying without --locked (slower, may hit version conflicts)"
+							if _run_cargo_install --path "$_spotty_src"; then
+								ok "cargo install spotty completed (unlocked)"
+							else
+								err "cargo install spotty failed."
+								info "Check the cargo output above. Common causes:"
+								info "  - outdated rustc (run: rustup update)"
+								info "  - insufficient disk space (cargo writes to TMPDIR=${_cargo_tmp_override:-$_tmp_target})"
+								info "  - upstream branch moved (the fork lives at"
+								info "    $_spotty_repo branch '$_spotty_branch')"
+							fi
+						fi
+					fi
+
+					# Clean up the redirected tmpdir; ~3 GB of intermediate
+					# rust artifacts aren't worth keeping after a successful
+					# install (cargo's own ~/.cargo cache is separate).
+					# We KEEP the spotty source checkout so a future
+					# wizard run can do an incremental rebuild.
+					if [ -n "$_cargo_tmp_override" ] && [ -d "$_cargo_tmp_override" ]; then
+						rm -rf "$_cargo_tmp_override" 2>/dev/null || true
+					fi
+					# Make ~/.cargo/bin available for the rest of this wizard run.
+					if [ -d "$HOME/.cargo/bin" ]; then
+						case ":$PATH:" in
+							*":$HOME/.cargo/bin:"*) ;;
+							*) PATH="$HOME/.cargo/bin:$PATH" ; export PATH ;;
+						esac
+					fi
+					probe_librespot
+					if $LIBRESPOT_OK; then
+						ok "$LIBRESPOT_BIN_NAME now in PATH: $LIBRESPOT_BIN"
+						if ! $LIBRESPOT_HAS_SINGLE_TRACK; then
+							warn "the installed binary still lacks --single-track; cargo install may have picked up a non-spotty librespot from PATH."
+							info "Try: rm -f \$HOME/.cargo/bin/librespot && re-run this wizard"
+						fi
+						info "  Persist for future shells by adding to ~/.bashrc:"
+						info "      export PATH=\"\$HOME/.cargo/bin:\$PATH\""
+					else
+						warn "spotty still not visible in PATH after install."
+					fi
+				fi
+			fi
+		fi
 	fi
 
 	# 7b. Python venv for scan-spotify
@@ -706,11 +1160,19 @@ if [ "$DO_STREAMING" = y ]; then
 	echo
 	info "Spotify Web API needs a free 'client id' to scan playlists."
 	info "Register an app at https://developer.spotify.com/dashboard"
-	info "and set its redirect URI to http://localhost:8888/callback."
+	info "and set its redirect URI to http://127.0.0.1:8888/callback."
+	info "(Spotify's policy now requires a loopback IP, not 'localhost'.)"
 	ask_str "Spotify SPOTIFY_CLIENT_ID (leave blank to skip):" ""
 	_client_id=$REPLY
 
 	if [ -n "$_client_id" ]; then
+		# The redirect URI must match exactly what's registered in the
+		# Spotify dashboard. Default to 127.0.0.1 per Spotify's loopback
+		# policy; allow override for users who registered something else.
+		ask_str "Spotify redirect URI (must match dashboard exactly):" \
+			"http://127.0.0.1:8888/callback"
+		_redirect_uri=$REPLY
+
 		_xdg_config=${XDG_CONFIG_HOME:-$HOME/.config}
 		STREAMING_ENV_FILE="$_xdg_config/xwax/streaming.env"
 		mkdir -p "$(dirname "$STREAMING_ENV_FILE")" \
@@ -726,8 +1188,10 @@ if [ "$DO_STREAMING" = y ]; then
 			printf '\n'
 			printf 'export SPOTIFY_CLIENT_ID=%s\n' "\"$_client_id\""
 			printf '\n'
-			printf '# Optional override; defaults to http://localhost:8888/callback\n'
-			printf '# export SPOTIFY_REDIRECT_URI="http://localhost:8888/callback"\n'
+			printf '# Must match the redirect URI registered in your Spotify\n'
+			printf '# dashboard exactly. Spotify requires a loopback IP\n'
+			printf '# (127.0.0.1, not localhost) for new apps since Apr 2025.\n'
+			printf 'export SPOTIFY_REDIRECT_URI=%s\n' "\"$_redirect_uri\""
 		} > "$_tmp" || die "could not write $_tmp"
 		mv "$_tmp" "$STREAMING_ENV_FILE" \
 			|| die "could not move $_tmp to $STREAMING_ENV_FILE"
@@ -736,6 +1200,80 @@ if [ "$DO_STREAMING" = y ]; then
 		ok "wrote $STREAMING_ENV_FILE (mode 0600)"
 	else
 		info "no client id entered; skipping streaming.env."
+	fi
+
+	# 7f. One-time Zeroconf pairing for the spotty/librespot binary.
+	#
+	# Without cached credentials, import-streaming cannot fetch tracks
+	# (it runs spotty --disable-discovery --single-track, which needs
+	# pre-saved auth). The pairing flow here writes credentials into
+	# $LIBRESPOT_CACHE; import-streaming reads from the same path.
+
+	if $LIBRESPOT_OK && $LIBRESPOT_HAS_SINGLE_TRACK; then
+		# Re-use existing credentials silently if already paired.
+		if [ -f "$LIBRESPOT_CACHE/credentials.json" ] \
+			|| [ -d "$LIBRESPOT_CACHE/credentials" ]; then
+			ok "$LIBRESPOT_BIN_NAME credentials already present at $LIBRESPOT_CACHE"
+			LIBRESPOT_PAIRED=true
+		else
+			echo
+			info "Spotify needs a one-time login before import-streaming can"
+			info "fetch tracks. The wizard will run $LIBRESPOT_BIN_NAME in the"
+			info "foreground as a Connect target named 'xwax-test'."
+			info ""
+			info "Steps:"
+			info "  1. Press ENTER to launch $LIBRESPOT_BIN_NAME here."
+			info "  2. On any phone or desktop running the official Spotify"
+			info "     app (logged in to your Premium account), tap the"
+			info "     Connect-to-a-device icon and pick 'xwax-test'."
+			info "  3. Once the Spotify app shows it's connected, return"
+			info "     here and press Ctrl-C. Credentials are then saved to"
+			info "     $LIBRESPOT_CACHE  and reused by import-streaming."
+			info ""
+			ask_yn "Run $LIBRESPOT_BIN_NAME pairing now?" "Y"
+			if [ "$REPLY" = y ]; then
+				mkdir -p "$LIBRESPOT_CACHE" \
+					|| die "could not create $LIBRESPOT_CACHE"
+				printf '\n  Press ENTER to launch %s, Ctrl-C inside it once paired... ' "$LIBRESPOT_BIN_NAME"
+				IFS= read -r _ || true
+				echo
+				info "----- $LIBRESPOT_BIN_NAME output (Ctrl-C when paired) -----"
+				# Trap our own SIGINT so Ctrl-C kills the child but
+				# returns control to this wizard.
+				trap : INT
+				"$LIBRESPOT_BIN" \
+					--name xwax-test \
+					--cache "$LIBRESPOT_CACHE" \
+					--backend pipe \
+					--bitrate 320 \
+					--device-type computer \
+					>/dev/null || true
+				trap - INT
+				echo
+				info "----- $LIBRESPOT_BIN_NAME stopped -----"
+				if [ -f "$LIBRESPOT_CACHE/credentials.json" ] \
+					|| [ -d "$LIBRESPOT_CACHE/credentials" ]; then
+					LIBRESPOT_PAIRED=true
+					ok "credentials saved at $LIBRESPOT_CACHE"
+				else
+					warn "no credentials saved at $LIBRESPOT_CACHE."
+					info "Did you select 'xwax-test' in the Spotify app before Ctrl-C?"
+					info "You can re-pair any time by running:"
+					info "    $LIBRESPOT_BIN_NAME --name xwax-test --backend pipe --cache $LIBRESPOT_CACHE >/dev/null"
+				fi
+			else
+				info "skipping pairing; you can pair later with:"
+				info "    $LIBRESPOT_BIN_NAME --name xwax-test --backend pipe --cache $LIBRESPOT_CACHE >/dev/null"
+				info "(--backend pipe avoids the rodio NoDeviceAvailable panic on systems"
+				info " where cpal can't find a default ALSA device, e.g. Pi OS + PipeWire.)"
+			fi
+		fi
+	elif $LIBRESPOT_OK; then
+		warn "$LIBRESPOT_BIN_NAME lacks --single-track; pairing flow skipped."
+		info "import-streaming needs --single-track support to fetch Spotify"
+		info "tracks. Install the spotty fork via:"
+		info "    cargo install --git https://github.com/michaelherger/librespot --branch spotty spotty"
+		info "and re-run this wizard."
 	fi
 fi
 
@@ -807,13 +1345,24 @@ if [ "$DO_STREAMING" = y ]; then
 		printf '    env file     : %s\n' "$STREAMING_ENV_FILE"
 		printf '    source it    : . %s\n' "$STREAMING_ENV_FILE"
 	fi
-	if ! $LIBRESPOT_HAS_SINGLE_TRACK; then
-		printf '    note         : install a recent librespot before using -s ./scan-spotify\n'
-	fi
 	if $LIBRESPOT_OK; then
-		printf '    librespot pairing (one-time, see README-streaming.md):\n'
-		printf '      librespot --name "xwax-test"\n'
-		printf '      then pick "xwax-test" in the official Spotify app -> Connect to a device\n'
+		printf '    %-13s: %s\n' "$LIBRESPOT_BIN_NAME" "$LIBRESPOT_BIN"
+		if $LIBRESPOT_PAIRED; then
+			printf '    paired       : credentials at %s\n' "$LIBRESPOT_CACHE"
+		else
+			printf '    paired       : NO  (re-run: %s --name xwax-test --backend pipe --cache %s >/dev/null)\n' \
+				"$LIBRESPOT_BIN_NAME" "$LIBRESPOT_CACHE"
+		fi
+		if ! $LIBRESPOT_HAS_SINGLE_TRACK; then
+			printf '    warning      : %s lacks --single-track; Spotify import will fail.\n' \
+				"$LIBRESPOT_BIN_NAME"
+			printf '                   Install the spotty fork:\n'
+			printf '                     cargo install --git https://github.com/michaelherger/librespot --branch spotty spotty\n'
+		fi
+	else
+		printf '    librespot    : not installed (Spotify import will fail)\n'
+		printf '                   Install the spotty fork:\n'
+		printf '                     cargo install --git https://github.com/michaelherger/librespot --branch spotty spotty\n'
 	fi
 	printf '    example combined launch:\n'
 	printf '      %s \\\n' "$XWAX_INVOKE"

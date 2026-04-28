@@ -22,15 +22,32 @@ points, BPM, overview meter) keeps working unchanged.
 ./install-wizard
 ```
 
-The Linux install wizard at the repo root detects which streaming
-tools are present, offers to create a Python venv for `scan-spotify`
-at `~/.local/share/xwax/streaming-venv`, makes the streaming scripts
-executable, and writes `~/.config/xwax/streaming.env` with your
-Spotify client id (so you can `source` it before launching xwax).
+The Linux install wizard at the repo root takes you end-to-end:
 
-It does *not* install distro packages for you (`ffmpeg`, `yt-dlp`,
-`jq`, `librespot`) — it tells you which are missing and prints the
-right command for your distro.
+* detects which streaming tools are present;
+* offers to install the **`spotty`** fork of librespot
+  ([michaelherger/librespot](https://github.com/michaelherger/librespot),
+  branch `spotty`) via
+  `cargo install --git ... --branch spotty spotty` if no
+  `--single-track`-capable binary is in `PATH`. The wizard prepends
+  `~/.cargo/bin` to `PATH` for the rest of the run. Mainline
+  `librespot` from crates.io is **not** used because it does not
+  ship the `--single-track` flag that `import-streaming` relies on;
+* runs the **one-time Zeroconf pairing** for you — launches
+  `spotty --name xwax-test --backend pipe --cache ~/.cache/xwax/librespot`,
+  waits while you pick *xwax-test* in the official Spotify app on
+  your phone or desktop, then verifies credentials were saved;
+* creates a Python venv for `scan-spotify` at
+  `~/.local/share/xwax/streaming-venv` and `pip install`s `spotipy`;
+* makes the streaming scripts executable;
+* writes `~/.config/xwax/streaming.env` with your Spotify client id
+  (so you can `source` it before launching xwax).
+
+The wizard does *not* install distro packages for the system tools
+(`ffmpeg`, `yt-dlp`, `jq`) — it tells you which are missing and
+prints the right command for your distro. `spotty` is the one
+exception: it isn't packaged by any distro and is built from the
+fork's source via cargo.
 
 ### Manual setup
 
@@ -41,7 +58,46 @@ System packages (install with your distro's package manager):
 | `ffmpeg`  | decoding / resampling                 | any streaming source  |
 | `yt-dlp`  | SoundCloud / http(s) extraction       | SoundCloud or http(s) |
 | `jq`      | parsing yt-dlp JSON in scan-soundcloud| SoundCloud            |
-| `librespot` | Spotify Connect audio                | Spotify               |
+| `spotty`  | Spotify Connect audio (`--single-track`) | Spotify            |
+
+`spotty` is a fork of `librespot` that adds the `--single-track`
+flag `import-streaming` needs. Mainline `librespot` (the
+`librespot-org/librespot` crate on crates.io) does **not** support
+`--single-track` and will not work as a replacement.
+
+Build dependencies: `git`, `pkg-config`, OpenSSL development headers
+(`libssl-dev` on Debian/Ubuntu, `openssl-devel` on Fedora) and ALSA
+development headers (`libasound2-dev` / `alsa-lib-devel`).
+
+Plain `cargo install --git ... spotty` does **not** work: the
+spotty branch does an unconditional `include_str!("client_id.txt")`
+at compile time and that file is `.gitignore`d upstream (the
+maintainer drops in their LMS plugin's id during their own
+release builds). You'll get:
+
+```
+error: couldn't read `src/client_id.txt`: No such file or directory
+```
+
+Workaround — clone, write an empty placeholder, install from path:
+
+```bash
+git clone --depth 1 --branch spotty \
+    https://github.com/michaelherger/librespot \
+    "$HOME/.cache/xwax/spotty-src"
+: > "$HOME/.cache/xwax/spotty-src/src/client_id.txt"
+cargo install --path "$HOME/.cache/xwax/spotty-src" --locked
+```
+
+The empty placeholder is fine for our use case: the value is only
+consumed by Spotify Web API code paths (e.g. `--get-token`) that
+`import-streaming` does not exercise. If you ever need a real id
+for those features, pass it at runtime via `--client-id`.
+
+`./install-wizard` runs exactly this dance for you (with a
+disk-backed `TMPDIR` redirect when `/tmp` is too small, automatic
+`rustup` install if `cargo` is missing, and the build-deps
+pre-flight check).
 
 Python (only for `scan-spotify`):
 
@@ -75,12 +131,18 @@ that require login are out of scope.
 Free Spotify developer registration; takes a minute:
 
 1. Go to <https://developer.spotify.com/dashboard> and create an app.
-2. Set the redirect URI to `http://localhost:8888/callback`.
-3. Export your client id:
+2. Set the redirect URI to `http://127.0.0.1:8888/callback`. Spotify
+   rejects `localhost` for apps registered after April 2025; the
+   redirect URI must be a loopback IP.
+3. Export your client id and the matching redirect URI:
 
    ```bash
    export SPOTIFY_CLIENT_ID=<your-client-id>
+   export SPOTIFY_REDIRECT_URI="http://127.0.0.1:8888/callback"
    ```
+
+   (`./install-wizard` writes both into `~/.config/xwax/streaming.env`
+   for you; just `source` it before launching xwax.)
 
 The first run of `scan-spotify` will pop a browser tab to grant the
 app access to your library; the token is then cached at
@@ -91,28 +153,56 @@ app access to your library; the token is then cached at
 > tempo data, scan-spotify silently emits records without BPM and
 > the catalog still populates correctly.
 
-**2. librespot login (for `import-streaming`)**
+**2. spotty login (for `import-streaming`)**
 
-`librespot` needs your Premium account credentials once. Easiest
-flow is Zeroconf discovery:
+`spotty` needs your Premium account credentials once. The
+`./install-wizard` flow does this for you, but the manual steps are:
 
-1. Run `librespot --name "xwax-test"` once on the same network as
-   the Spotify app on your phone/desktop.
-2. In the official Spotify app, open *Connect to a device* and
-   pick `xwax-test`.
-3. Credentials are cached; future invocations work headless.
+1. Pair once via Zeroconf, **into the same cache directory
+   `import-streaming` reads from**, and use `--backend pipe` so the
+   client doesn't try to open an audio device (the default `rodio`
+   backend panics with `NoDeviceAvailable` on hosts where cpal can't
+   find a default ALSA card, e.g. Pi OS + PipeWire):
 
-If your `librespot` build does not include `--single-track`
-(mainline supports it; some distro packages ship older builds),
-either use a recent `librespot` from <https://github.com/librespot-org/librespot>
-or build from source with `cargo install librespot`.
+   ```bash
+   spotty --name xwax-test --backend pipe \
+       --cache "${XDG_CACHE_HOME:-$HOME/.cache}/xwax/librespot" \
+       >/dev/null
+   ```
+
+2. In the official Spotify app on a phone or desktop on the same
+   network, open *Connect to a device* and pick `xwax-test`.
+3. Once it shows as connected, Ctrl-C `spotty`. Credentials are now
+   persisted at `~/.cache/xwax/librespot/credentials.json` (the
+   directory keeps its `librespot` name for backward compatibility
+   with existing pairings; you can also point spotty at a different
+   path if you prefer).
+4. Future `import-streaming` invocations pass the same `--cache`
+   path with `--disable-discovery --single-track` and authenticate
+   silently. `import-streaming` looks for `spotty` first, then falls
+   back to `librespot` only if it advertises `--single-track`.
+
+> **Why not mainline librespot?** The CLI binary published by
+> `librespot-org/librespot` does not have a `--single-track` flag.
+> The flag is specific to the `spotty` fork (originally built for
+> the Logitech Media Server Spotty plugin). `import-streaming`
+> needs a "fetch one URI, write PCM to stdout, exit" mode, and
+> `spotty --single-track` is the cleanest way to get that today.
+
+`./install-wizard` will offer to do the cargo install for you and
+add `~/.cargo/bin` to `PATH` for the current session. Persist it
+across shells by appending to `~/.bashrc`:
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+```
 
 > **DRM caveat:** Some Spotify content (newer hi-fi tracks, certain
-> podcasts) is Widevine-only and librespot cannot decode it. Those
-> tracks still appear in the catalog from `scan-spotify`; the
-> import will fail and xwax displays "Error importing" via its
-> existing status path. No code path here attempts to circumvent
-> Widevine.
+> podcasts) is Widevine-only and the librespot/spotty stack cannot
+> decode it. Those tracks still appear in the catalog from
+> `scan-spotify`; the import will fail and xwax displays
+> "Error importing" via its existing status path. No code path here
+> attempts to circumvent Widevine.
 
 ## Running xwax with streaming crates
 
@@ -137,7 +227,8 @@ see `library.c:597`); the *All records* crate aggregates them.
 The single `-i ./import-streaming` covers every crate because the
 importer dispatches on the per-track pathname:
 
-* `spotify:track:<id>` → `librespot` pipe
+* `spotify:track:<id>` → `spotty` (or `librespot` if it advertises
+  `--single-track`) pipe
 * `http(s)://…` → `yt-dlp` pipe (SoundCloud, YouTube, Bandcamp, …)
 * anything else → delegates to the stock `./import` script
 
@@ -149,9 +240,9 @@ importer dispatches on the per-track pathname:
 | SoundCloud | typically 5–20× real-time        | instant        |
 | Spotify    | roughly real-time (~5 min track ≈ 5 min wait) | instant |
 
-Spotify is the slow one because librespot streams via the same
-Connect protocol used by hardware speakers. Once a track has been
-loaded once, the cache makes the next scratch instant.
+Spotify is the slow one because spotty/librespot streams via the
+same Connect protocol used by hardware speakers. Once a track has
+been loaded once, the cache makes the next scratch instant.
 
 ## Cache
 
@@ -169,12 +260,25 @@ holds roughly 400 tracks.
 
 ## Troubleshooting
 
-* **"librespot: unrecognized argument '--single-track'"** — install
-  a recent librespot (`cargo install librespot`).
+* **"librespot: unrecognized argument '--single-track'"** or
+  **"warning: your librespot lacks --single-track"** — you have
+  mainline `librespot` installed (it has never shipped this flag).
+  Install the `spotty` fork (see Manual setup above for the full
+  recipe — `cargo install --git ... spotty` alone fails on a
+  missing `client_id.txt`, the wizard handles that).
+  `import-streaming` and the wizard look for `spotty` first, so
+  installing it alongside mainline `librespot` is enough — you do
+  not need to uninstall the mainline binary.
+* **"couldn't read `src/client_id.txt`: No such file or
+  directory"** while installing spotty — the spotty branch
+  references a file the upstream maintainer keeps out of git. Use
+  the `git clone` + empty-placeholder + `cargo install --path`
+  recipe in *Manual setup*, or just rerun `./install-wizard` which
+  does this automatically.
 * **"Track import completed with status …"** in xwax's status bar —
   the importer process exited non-zero. Run `import-streaming
   '<pathname>' 44100 > /dev/null` directly in a terminal to see the
-  underlying error from librespot or yt-dlp.
+  underlying error from spotty/librespot or yt-dlp.
 * **Spotify auth loops in browser** — make sure the redirect URI in
   your Spotify dashboard exactly matches `SPOTIFY_REDIRECT_URI`.
 * **No BPM on Spotify tracks** — your Spotify app lacks the

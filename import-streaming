@@ -11,7 +11,7 @@
 #
 # Dispatches on <pathname>:
 #
-#   spotify:track:<id>      librespot     -> ffmpeg (resample if needed)
+#   spotify:track:<id>      spotty        -> ffmpeg (resample if needed)
 #   spotify:<other>:<id>    rejected (only individual tracks are loadable)
 #   http://...  https://... yt-dlp        -> ffmpeg
 #   anything else           delegated to ./import (the stock script)
@@ -20,12 +20,25 @@
 # by sha1(pathname:rate), so re-loading the same track during a set
 # is instant. Cache size is capped (see XWAX_CACHE_BYTES below).
 #
+# Spotify auth: the librespot client reads cached credentials from
+# $XDG_CACHE_HOME/xwax/librespot (same directory the install-wizard
+# pairing flow writes to). We prefer the 'spotty' fork
+# (https://github.com/michaelherger/librespot, branch 'spotty')
+# because it adds the --single-track flag we need below; mainline
+# librespot does NOT ship that flag.
+# Pair once with:
+#   spotty --name xwax-test --backend pipe \
+#       --cache "$XDG_CACHE_HOME/xwax/librespot" >/dev/null
+# (--backend pipe avoids the default rodio backend trying to open
+# an ALSA device for playback during pairing.)
+#
 # Environment:
 #   XWAX_CACHE_BYTES   Cache size cap, default 20 GiB. 0 disables cache.
 #   XDG_CACHE_HOME     Base for the cache. Default $HOME/.cache.
 #
 # External tools required only for the source(s) you actually use:
-#   librespot, yt-dlp, ffmpeg, sha1sum
+#   spotty (or another librespot fork that supports --single-track),
+#   yt-dlp, ffmpeg, sha1sum
 #
 
 set -eu -o pipefail
@@ -42,6 +55,10 @@ fi
 
 CACHE_BASE="${XDG_CACHE_HOME:-$HOME/.cache}/xwax/streaming"
 CACHE_BYTES_CAP="${XWAX_CACHE_BYTES:-21474836480}" # 20 GiB
+
+# librespot's own credentials/audio cache. Must match the path the
+# install-wizard pairing flow uses.
+LIBRESPOT_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/xwax/librespot"
 
 cache_key() {
     # sha1 of "<pathname>:<rate>" — same pathname at different sample
@@ -90,19 +107,59 @@ decode_spotify() {
             ;;
     esac
 
-    if ! command -v librespot >/dev/null 2>&1; then
-        echo "import-streaming: 'librespot' not in PATH (needed for Spotify)" >&2
+    # Pick a librespot-family binary. Prefer 'spotty' (the
+    # michaelherger/librespot fork) because it supports --single-track,
+    # which is the entire reason we shell out: fetch one URI, write PCM
+    # to stdout, exit. Mainline librespot has never had --single-track.
+    # If we find a binary that lacks the flag we error out clearly
+    # instead of silently producing garbage.
+    local lr_bin lr_name
+    lr_bin=
+    for cand in spotty librespot; do
+        if command -v "$cand" >/dev/null 2>&1; then
+            lr_bin=$(command -v "$cand")
+            lr_name=$cand
+            if "$cand" --help 2>&1 | grep -q -- '--single-track'; then
+                break
+            fi
+            # Found one but no --single-track; keep looking in case a
+            # better candidate is also installed.
+            lr_bin=
+        fi
+    done
+
+    if [ -z "$lr_bin" ]; then
+        if command -v librespot >/dev/null 2>&1; then
+            echo "import-streaming: librespot is installed but lacks --single-track." >&2
+            echo "  Mainline librespot does not ship this flag. Install the spotty fork:" >&2
+            echo "    cargo install --git https://github.com/michaelherger/librespot --branch spotty spotty" >&2
+            echo "  (Or run ./install-wizard which does this automatically.)" >&2
+        else
+            echo "import-streaming: no librespot-family binary in PATH (looked for: spotty, librespot)" >&2
+            echo "  Install the spotty fork (mainline librespot lacks --single-track):" >&2
+            echo "    cargo install --git https://github.com/michaelherger/librespot --branch spotty spotty" >&2
+            echo "  (Or run ./install-wizard which does this automatically.)" >&2
+        fi
         exit 1
     fi
 
-    # --single-track makes librespot fetch the URI then exit instead of
-    # sitting as a Connect device. Mainline librespot supports this; if
-    # your build does not, see README-streaming.md for alternatives.
-    librespot \
+    if [ ! -f "$LIBRESPOT_CACHE/credentials.json" ] \
+        && [ ! -d "$LIBRESPOT_CACHE/credentials" ]; then
+        echo "import-streaming: no $lr_name credentials at $LIBRESPOT_CACHE" >&2
+        echo "  Pair once: ./install-wizard   (or manually:" >&2
+        echo "  $lr_name --name xwax-test --backend pipe --cache $LIBRESPOT_CACHE >/dev/null )" >&2
+        exit 1
+    fi
+
+    # --single-track makes the client fetch the URI then exit instead
+    # of sitting as a Connect device. See header for which librespot
+    # forks support this.
+    "$lr_bin" \
         --backend pipe \
         --bitrate 320 \
         --quiet \
         --disable-discovery \
+        --cache "$LIBRESPOT_CACHE" \
         --single-track "$uri"
 }
 

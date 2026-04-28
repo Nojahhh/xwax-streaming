@@ -13,36 +13,44 @@ if [ -z "$PY" ] && [ -x "$HOME/.local/share/xwax/streaming-venv/bin/python3" ]; 
 fi
 exec "${PY:-python3}" "$0" "$@"
 ":"""
-"""scan-spotify: xwax library scanner for Spotify playlists/albums/saved tracks.
-
-Emits xwax scan-format lines on stdout:
-
-    <pathname>\\t<artist>\\t<title>[\\t<bpm>]\\n
-
-<pathname> is always the canonical "spotify:track:<id>" URI, which
-import-streaming hands to librespot for download/decode.
-
-Accepted target arguments:
-
-    liked
-    playlist:<playlist_id>
-    playlist:<owner>:<playlist_id>
-    album:<album_id>
-    spotify:{playlist,album,track}:<id>
-    https://open.spotify.com/{playlist,album,track}/<id>[?...]
-
-Environment:
-
-    SPOTIFY_CLIENT_ID     OAuth client id (required). Register a free
-                          app at https://developer.spotify.com/dashboard.
-    SPOTIFY_REDIRECT_URI  OAuth redirect URI. Must match the value
-                          registered in the Spotify dashboard.
-                          Default: http://localhost:8888/callback
-    XDG_CACHE_HOME        Used for the auth-token cache file.
-    XWAX_STREAMING_PY     Override the Python interpreter the polyglot
-                          shebang uses (advanced).
-"""
+# NOTE: `from __future__ import annotations` MUST come before any
+# other Python statement other than the polyglot docstring above.
+# Putting another triple-quoted string here would turn it into a
+# second statement and break the future-import rule, so the human-
+# readable description is kept as plain comments instead of a
+# module docstring.
 from __future__ import annotations
+
+# scan-spotify: xwax library scanner for Spotify playlists/albums/saved tracks.
+#
+# Emits xwax scan-format lines on stdout:
+#
+#     <pathname>\t<artist>\t<title>[\t<bpm>]\n
+#
+# <pathname> is always the canonical "spotify:track:<id>" URI, which
+# import-streaming hands to librespot for download/decode.
+#
+# Accepted target arguments:
+#
+#     liked
+#     playlist:<playlist_id>
+#     playlist:<owner>:<playlist_id>
+#     album:<album_id>
+#     spotify:{playlist,album,track}:<id>
+#     https://open.spotify.com/{playlist,album,track}/<id>[?...]
+#
+# Environment:
+#
+#     SPOTIFY_CLIENT_ID     OAuth client id (required). Register a free
+#                           app at https://developer.spotify.com/dashboard.
+#     SPOTIFY_REDIRECT_URI  OAuth redirect URI. Must match the value
+#                           registered in the Spotify dashboard.
+#                           Default: http://127.0.0.1:8888/callback
+#                           (Spotify rejects 'localhost' for apps
+#                           registered after Apr 2025; use 127.0.0.1.)
+#     XDG_CACHE_HOME        Used for the auth-token cache file.
+#     XWAX_STREAMING_PY     Override the Python interpreter the polyglot
+#                           shebang uses (advanced).
 
 import os
 import re
@@ -62,7 +70,7 @@ except ImportError:
 
 
 SCOPES = "user-library-read playlist-read-private playlist-read-collaborative"
-DEFAULT_REDIRECT = "http://localhost:8888/callback"
+DEFAULT_REDIRECT = "http://127.0.0.1:8888/callback"
 
 CACHE_DIR = Path(
     os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")

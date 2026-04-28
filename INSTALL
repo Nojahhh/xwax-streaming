@@ -1,6 +1,7 @@
 EASIEST: run the interactive Linux wizard
 ------------------------------------------
 
+  $ chmod +x install-wizard          # only needed once
   $ ./install-wizard
 
 It probes your distro, CPU, audio interfaces, and libraries, then
@@ -9,6 +10,17 @@ step. It can also set up the streaming integration (SoundCloud /
 Spotify): detect ffmpeg/yt-dlp/jq/librespot, create a Python venv for
 scan-spotify, and capture your Spotify client id. See the README and
 README-streaming.md for what those features do.
+
+If your checkout came through a path that dropped POSIX execute bits
+(zip download, Windows-mounted share, etc.), you can also run it
+directly via the shell:
+
+  $ bash ./install-wizard
+
+DO NOT run the wizard with sudo. It will sudo by itself for the
+'make install' step when the prefix is outside your $HOME. Running
+the whole wizard as root leaves root-owned files (.config, .version,
+*.o) in the source tree that block subsequent normal-user runs.
 
 The wizard is interactive only. The manual flow below stays available
 for scripted / non-Linux setups and for power users who want full

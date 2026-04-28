@@ -120,7 +120,18 @@ fi
 
 if $PI4; then
 	echo "Raspberry Pi 4 optimizations enabled"
-	echo "CFLAGS += -mcpu=cortex-a72 -mfpu=neon-fp-armv8 -mfloat-abi=hard" >> $OUTPUT
+	case "$(uname -m)" in
+		aarch64|arm64)
+			echo "CFLAGS += -mcpu=cortex-a72" >> $OUTPUT
+			;;
+		armv7l|armv7*|armhf)
+			echo "CFLAGS += -mcpu=cortex-a72 -mfpu=neon-fp-armv8 -mfloat-abi=hard" >> $OUTPUT
+			;;
+		*)
+			echo "  warning: --enable-pi4 with unknown arch $(uname -m); passing -mcpu=cortex-a72 only" >&2
+			echo "CFLAGS += -mcpu=cortex-a72" >> $OUTPUT
+			;;
+	esac
 fi
 
 if $DEBUG && $PROFILE; then

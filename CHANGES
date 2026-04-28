@@ -1,4 +1,18 @@
+v2.0 (2026-04-28)
+-----------------
+
+* Stream tracks from SoundCloud and other yt-dlp-supported sources
+  (YouTube, Bandcamp, Mixcloud, ...) with full DVS feature parity
+* Stream tracks from Spotify Premium via librespot (personal use)
+* New 'scan-soundcloud' library scanner using yt-dlp
+* New 'scan-spotify' library scanner using the Spotify Web API,
+  with PKCE OAuth and batched audio_features for BPM
+* New 'import-streaming' importer; dispatches by URI scheme and
+  delegates local files to the existing 'import' script unchanged
+* On-disk PCM cache for streamed tracks with LRU eviction, keyed by
+  URI and sample rate (default 20 GiB, configurable)
 * Fix a bug where decimal numbers are parsed in an unexpected way
+* See README-streaming.md for setup, authentication and caveats
 
 v1.7 (2018-01-19)
 -----------------

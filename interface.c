@@ -17,6 +17,8 @@
  *
  */
 
+#define _GNU_SOURCE /* strdupa() */
+
 #include <assert.h>
 #include <errno.h>
 #include <iconv.h>
