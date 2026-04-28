@@ -1,0 +1,15 @@
+# Python dependencies for xwax streaming integration.
+#
+# Only required if you use scan-spotify. The other scripts
+# (scan-soundcloud, import-streaming) are pure shell.
+#
+#   pip install -r requirements-streaming.txt
+#
+# System packages (install with your package manager — not pip):
+#   yt-dlp     SoundCloud + http(s) extraction (and YouTube/Bandcamp/etc.)
+#   ffmpeg     Audio decoding and resampling
+#   librespot  Spotify playback (Premium account required)
+#   jq         JSON parsing in scan-soundcloud
+#   coreutils  sha1sum, du, find, stat (already present on Linux)
+
+spotipy>=2.23

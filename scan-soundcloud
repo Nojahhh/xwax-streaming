@@ -1,0 +1,58 @@
+#!/bin/bash
+#
+# scan-soundcloud: xwax library scanner for SoundCloud URLs.
+#
+# Emits one line per track in xwax's scan contract:
+#
+#   <pathname>\t<artist>\t<title>[\t<bpm>]\n
+#
+# where <pathname> is the SoundCloud track URL (passed to
+# import-streaming at load time). BPM is omitted because the fast
+# --flat-playlist mode does not return per-track audio features.
+#
+# Argument is anything yt-dlp can resolve as a SoundCloud target:
+# a track URL, a /sets/ playlist URL, or a user's /likes,
+# /tracks, /reposts, /albums URL.
+#
+
+set -eu -o pipefail
+
+URL="${1:-}"
+if [ -z "$URL" ]; then
+    echo "$0: usage: $0 <soundcloud-url>" >&2
+    exit 2
+fi
+
+for cmd in yt-dlp jq; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "$0: required command '$cmd' not found in PATH" >&2
+        exit 1
+    fi
+done
+
+echo "Scanning SoundCloud: $URL" >&2
+
+# --flat-playlist makes one cheap HTTP call per page and yields
+# url/title/uploader without resolving each track. That keeps the
+# crate population fast (the user can still scratch any track —
+# import-streaming resolves it on demand).
+
+yt-dlp \
+    --quiet --no-warnings \
+    --flat-playlist \
+    --dump-single-json \
+    "$URL" |
+jq -r '
+    # Normalise so a single-track URL and a playlist look the same.
+    (if .entries == null then [.] else .entries end)
+    | .[]
+    | select(.url != null and .url != "")
+    | {
+        url:      .url,
+        title:    (.title    // ""),
+        uploader: (.uploader // .channel // .artist // "")
+      }
+    | [.url, .uploader, .title]
+    | map(tostring | gsub("[\t\n\r]"; " "))
+    | join("\t")
+'

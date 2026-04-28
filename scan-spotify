@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""scan-spotify: xwax library scanner for Spotify playlists/albums/saved tracks.
+
+Emits xwax scan-format lines on stdout:
+
+    <pathname>\\t<artist>\\t<title>[\\t<bpm>]\\n
+
+<pathname> is always the canonical "spotify:track:<id>" URI, which
+import-streaming hands to librespot for download/decode.
+
+Accepted target arguments:
+
+    liked
+    playlist:<playlist_id>
+    playlist:<owner>:<playlist_id>
+    album:<album_id>
+    spotify:{playlist,album,track}:<id>
+    https://open.spotify.com/{playlist,album,track}/<id>[?...]
+
+Environment:
+
+    SPOTIFY_CLIENT_ID     OAuth client id (required). Register a free
+                          app at https://developer.spotify.com/dashboard.
+    SPOTIFY_REDIRECT_URI  OAuth redirect URI. Must match the value
+                          registered in the Spotify dashboard.
+                          Default: http://localhost:8888/callback
+    XDG_CACHE_HOME        Used for the auth-token cache file.
+"""
+from __future__ import annotations
+
+import os
+import re
+import sys
+from pathlib import Path
+
+try:
+    import spotipy
+    from spotipy.oauth2 import SpotifyPKCE
+except ImportError:
+    sys.stderr.write(
+        "scan-spotify: missing dependency 'spotipy'.\n"
+        "  pip install -r requirements-streaming.txt\n"
+    )
+    sys.exit(1)
+
+
+SCOPES = "user-library-read playlist-read-private playlist-read-collaborative"
+DEFAULT_REDIRECT = "http://localhost:8888/callback"
+
+CACHE_DIR = Path(
+    os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")
+) / "xwax"
+TOKEN_CACHE = CACHE_DIR / "spotify-token.json"
+
+
+def die(msg: str, code: int = 1) -> None:
+    sys.stderr.write(f"scan-spotify: {msg}\n")
+    sys.exit(code)
+
+
+def make_client() -> spotipy.Spotify:
+    client_id = os.environ.get("SPOTIFY_CLIENT_ID")
+    if not client_id:
+        die(
+            "SPOTIFY_CLIENT_ID is not set.\n"
+            "  1. Register an app at https://developer.spotify.com/dashboard\n"
+            f"  2. Set its redirect URI to {DEFAULT_REDIRECT}\n"
+            "  3. export SPOTIFY_CLIENT_ID=<your-client-id>"
+        )
+
+    redirect_uri = os.environ.get("SPOTIFY_REDIRECT_URI", DEFAULT_REDIRECT)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    auth = SpotifyPKCE(
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        scope=SCOPES,
+        cache_path=str(TOKEN_CACHE),
+        open_browser=True,
+    )
+    return spotipy.Spotify(auth_manager=auth, requests_timeout=20, retries=3)
+
+
+def parse_target(arg: str) -> tuple[str, str | None]:
+    """Return (kind, id_or_none) where kind is liked/playlist/album/track."""
+    if arg in ("liked", "saved"):
+        return "liked", None
+
+    m = re.fullmatch(
+        r"spotify:(playlist|album|track):([A-Za-z0-9]+)", arg
+    )
+    if m:
+        return m.group(1), m.group(2)
+
+    m = re.fullmatch(
+        r"https?://open\.spotify\.com/(?:intl-[a-z]+/)?"
+        r"(playlist|album|track)/([A-Za-z0-9]+)(?:\?.*)?",
+        arg,
+    )
+    if m:
+        return m.group(1), m.group(2)
+
+    m = re.fullmatch(
+        r"(playlist|album|track):(?:[^:]+:)?([A-Za-z0-9]+)", arg
+    )
+    if m:
+        return m.group(1), m.group(2)
+
+    die(f"could not parse target {arg!r}")
+    return "", None  # unreachable
+
+
+def sanitize(s: str) -> str:
+    return re.sub(r"[\t\n\r]+", " ", (s or "").strip())
+
+
+def iter_paged(sp: spotipy.Spotify, first_page: dict):
+    page = first_page
+    while page is not None:
+        for item in page.get("items") or []:
+            yield item
+        if page.get("next"):
+            page = sp.next(page)
+        else:
+            page = None
+
+
+def collect_tracks(
+    sp: spotipy.Spotify, kind: str, item_id: str | None
+) -> list[dict]:
+    if kind == "liked":
+        out: list[dict] = []
+        page = sp.current_user_saved_tracks(limit=50)
+        for it in iter_paged(sp, page):
+            t = (it or {}).get("track")
+            if t:
+                out.append(t)
+        return out
+
+    if kind == "track":
+        t = sp.track(item_id)
+        return [t] if t else []
+
+    if kind == "album":
+        page = sp.album_tracks(item_id, limit=50)
+        ids = [it["id"] for it in iter_paged(sp, page)
+               if it and it.get("id")]
+        out = []
+        for chunk_start in range(0, len(ids), 50):
+            chunk = ids[chunk_start:chunk_start + 50]
+            full = sp.tracks(chunk).get("tracks") or []
+            out.extend(t for t in full if t)
+        return out
+
+    if kind == "playlist":
+        out = []
+        page = sp.playlist_items(
+            item_id,
+            additional_types=("track",),
+            limit=100,
+        )
+        for it in iter_paged(sp, page):
+            t = (it or {}).get("track")
+            if t and t.get("type") == "track":
+                out.append(t)
+        return out
+
+    die(f"unsupported kind {kind!r}")
+    return []
+
+
+def fetch_bpms(sp: spotipy.Spotify, ids: list[str]) -> dict[str, float]:
+    """Best-effort BPM lookup via audio-features.
+
+    The audio-features endpoint is unavailable for Spotify apps
+    registered after 2024-11-27. We silently fall back to no BPM
+    so the catalog still populates."""
+    bpms: dict[str, float] = {}
+    for start in range(0, len(ids), 100):
+        chunk = ids[start:start + 100]
+        try:
+            feats = sp.audio_features(chunk) or []
+        except spotipy.SpotifyException as exc:
+            sys.stderr.write(
+                f"scan-spotify: audio_features unavailable "
+                f"(HTTP {exc.http_status}); BPM omitted.\n"
+            )
+            return bpms
+        for f in feats:
+            if f and f.get("id") and f.get("tempo"):
+                bpms[f["id"]] = float(f["tempo"])
+    return bpms
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 2:
+        sys.stderr.write(
+            "usage: scan-spotify <target>\n"
+            "  target: liked | playlist:<id> | album:<id> | "
+            "spotify:<kind>:<id> | open.spotify.com URL\n"
+        )
+        return 2
+
+    kind, item_id = parse_target(argv[1])
+    sys.stderr.write(f"Scanning Spotify: kind={kind} id={item_id}\n")
+
+    sp = make_client()
+    tracks = collect_tracks(sp, kind, item_id)
+    sys.stderr.write(f"Found {len(tracks)} tracks; fetching BPM...\n")
+
+    track_ids = [t["id"] for t in tracks if t.get("id")]
+    bpms = fetch_bpms(sp, track_ids) if track_ids else {}
+
+    for t in tracks:
+        tid = t.get("id")
+        if not tid:
+            continue
+        artist = ", ".join(
+            a.get("name", "") for a in (t.get("artists") or []) if a
+        )
+        title = t.get("name", "")
+        fields = [
+            f"spotify:track:{tid}",
+            sanitize(artist),
+            sanitize(title),
+        ]
+        bpm = bpms.get(tid)
+        if bpm and bpm > 0:
+            fields.append(f"{bpm:.2f}")
+        sys.stdout.write("\t".join(fields) + "\n")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -1,0 +1,196 @@
+#!/bin/bash
+#
+# import-streaming: universal xwax importer.
+#
+# Same contract as the stock 'import' script: invoked as
+#
+#   import-streaming <pathname> <rate>
+#
+# and writes signed-little-endian 16-bit stereo PCM at <rate> Hz to
+# stdout. Errors to stderr.
+#
+# Dispatches on <pathname>:
+#
+#   spotify:track:<id>      librespot     -> ffmpeg (resample if needed)
+#   spotify:<other>:<id>    rejected (only individual tracks are loadable)
+#   http://...  https://... yt-dlp        -> ffmpeg
+#   anything else           delegated to ./import (the stock script)
+#
+# A decoded copy is cached at $XDG_CACHE_HOME/xwax/streaming/ keyed
+# by sha1(pathname:rate), so re-loading the same track during a set
+# is instant. Cache size is capped (see XWAX_CACHE_BYTES below).
+#
+# Environment:
+#   XWAX_CACHE_BYTES   Cache size cap, default 20 GiB. 0 disables cache.
+#   XDG_CACHE_HOME     Base for the cache. Default $HOME/.cache.
+#
+# External tools required only for the source(s) you actually use:
+#   librespot, yt-dlp, ffmpeg, sha1sum
+#
+
+set -eu -o pipefail
+
+PATHNAME="${1:-}"
+RATE="${2:-}"
+
+if [ -z "$PATHNAME" ] || [ -z "$RATE" ]; then
+    echo "usage: $0 <pathname> <rate>" >&2
+    exit 2
+fi
+
+# ---------------------------------------------------------------- cache layer
+
+CACHE_BASE="${XDG_CACHE_HOME:-$HOME/.cache}/xwax/streaming"
+CACHE_BYTES_CAP="${XWAX_CACHE_BYTES:-21474836480}" # 20 GiB
+
+cache_key() {
+    # sha1 of "<pathname>:<rate>" — same pathname at different sample
+    # rates yields different files (xwax's deck rate is configurable).
+    printf '%s:%s' "$1" "$2" | sha1sum | cut -c1-40
+}
+
+cache_sweep() {
+    # Best-effort LRU eviction. Pure GNU coreutils (find -printf, du).
+    [ "$CACHE_BYTES_CAP" = "0" ] && return 0
+    [ -d "$CACHE_BASE" ] || return 0
+
+    local used
+    used=$(du -sb "$CACHE_BASE" 2>/dev/null | awk '{print $1+0}')
+    [ -z "$used" ] && used=0
+    [ "$used" -le "$CACHE_BYTES_CAP" ] && return 0
+
+    echo "import-streaming: cache over cap (${used}/${CACHE_BYTES_CAP} bytes), evicting" >&2
+
+    # Sort by access time ascending; delete until under cap.
+    while [ "$used" -gt "$CACHE_BYTES_CAP" ]; do
+        local victim sz
+        victim=$(find "$CACHE_BASE" -maxdepth 1 -type f -name '*.s16' \
+                      -printf '%A@\t%s\t%p\n' 2>/dev/null \
+                  | sort -n | head -1)
+        [ -z "$victim" ] && break
+        sz=$(printf '%s' "$victim" | cut -f2)
+        path=$(printf '%s' "$victim" | cut -f3-)
+        rm -f -- "$path"
+        used=$((used - sz))
+    done
+}
+
+# ----------------------------------------------------------------- decoders
+
+# All decoders write S16LE stereo at 44100 Hz; the resample stage is
+# applied uniformly so each source backend stays simple.
+
+decode_spotify() {
+    local uri="$1"
+    case "$uri" in
+        spotify:track:*) ;;
+        *)
+            echo "import-streaming: only spotify:track:<id> URIs are loadable, got '$uri'" >&2
+            exit 1
+            ;;
+    esac
+
+    if ! command -v librespot >/dev/null 2>&1; then
+        echo "import-streaming: 'librespot' not in PATH (needed for Spotify)" >&2
+        exit 1
+    fi
+
+    # --single-track makes librespot fetch the URI then exit instead of
+    # sitting as a Connect device. Mainline librespot supports this; if
+    # your build does not, see README-streaming.md for alternatives.
+    librespot \
+        --backend pipe \
+        --bitrate 320 \
+        --quiet \
+        --disable-discovery \
+        --single-track "$uri"
+}
+
+decode_http() {
+    local url="$1"
+    if ! command -v yt-dlp >/dev/null 2>&1; then
+        echo "import-streaming: 'yt-dlp' not in PATH (needed for $url)" >&2
+        exit 1
+    fi
+
+    # bestaudio + decode-to-pipe; yt-dlp handles SoundCloud, YouTube,
+    # Bandcamp, Mixcloud and many more under the same contract.
+    yt-dlp \
+        --quiet --no-warnings \
+        --no-playlist \
+        -f 'bestaudio/best' \
+        -o - \
+        "$url" |
+    ffmpeg -v 0 -i pipe: -f s16le -ar 44100 -ac 2 -
+}
+
+# Resample stage: if RATE != 44100, run a second ffmpeg; otherwise pass
+# bytes through unchanged. Wrapped in a function so the producer
+# pipelines stay readable.
+
+resample_to_target() {
+    if [ "$RATE" = "44100" ]; then
+        cat
+    else
+        ffmpeg -v 0 -f s16le -ar 44100 -ac 2 -i pipe: \
+                    -f s16le -ar "$RATE" -ac 2 -
+    fi
+}
+
+# --------------------------------------------------------------- main flow
+
+# 1. Local path / unrecognised URI -> hand over to the stock importer.
+case "$PATHNAME" in
+    spotify:*|http://*|https://*)
+        ;;
+    *)
+        FALLBACK="$(dirname -- "$0")/import"
+        if [ ! -x "$FALLBACK" ]; then
+            echo "import-streaming: no fallback importer at $FALLBACK" >&2
+            exit 1
+        fi
+        exec "$FALLBACK" "$PATHNAME" "$RATE"
+        ;;
+esac
+
+# 2. Cache hit -> stream the cached PCM as-is. Bump atime so LRU keeps it warm.
+KEY=$(cache_key "$PATHNAME" "$RATE")
+CACHE_FILE="$CACHE_BASE/$KEY.s16"
+
+if [ -s "$CACHE_FILE" ]; then
+    echo "import-streaming: cache hit $KEY ($(basename -- "$CACHE_FILE"))" >&2
+    touch -a -- "$CACHE_FILE" 2>/dev/null || true
+    exec cat -- "$CACHE_FILE"
+fi
+
+# 3. Cache miss -> decode, tee to a tmp file, promote on clean completion.
+mkdir -p -- "$CACHE_BASE"
+cache_sweep
+
+TMP="$CACHE_BASE/$KEY.tmp.$$"
+# If we're killed mid-import (deck swap, xwax exit) the partial file
+# must not be promoted, and any decoder children must be reaped.
+# xwax's track_release sends SIGTERM to this script (track.c:376);
+# without an explicit kill, librespot/yt-dlp can orphan past us.
+cleanup() {
+    rm -f -- "$TMP"
+    pkill -P $$ 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+echo "import-streaming: importing '$PATHNAME' at ${RATE} Hz" >&2
+
+case "$PATHNAME" in
+    spotify:*)
+        decode_spotify "$PATHNAME" | resample_to_target | tee -- "$TMP"
+        ;;
+    http://*|https://*)
+        decode_http "$PATHNAME"    | resample_to_target | tee -- "$TMP"
+        ;;
+esac
+
+# pipefail above means we only get here if every stage exited 0.
+if [ -s "$TMP" ]; then
+    mv -- "$TMP" "$CACHE_FILE"
+    echo "import-streaming: cached as $KEY ($(stat -c %s -- "$CACHE_FILE") bytes)" >&2
+fi
